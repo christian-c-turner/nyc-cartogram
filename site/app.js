@@ -828,9 +828,12 @@ function computeTravelField(originPoint) {
     const platform =
       (meta.stationAccessMinutes[routeState.mode] ?? 1.5) + (bike ? meta.bikeStationExtraMinutes[routeState.mode] ?? 1 : 0);
     alightCost[index] = routeState.linkMeters / streetSpeed + platform;
-    // Movia doesn't take bikes on buses, so with the bike on they can't be boarded.
+    // Movia doesn't take bikes on buses, so with the bike on they can't be boarded. Rides are timed
+    // from arrival at each station, so the line's dwell there comes off the wait for its departure.
     boardCost[index] =
-      bike && routeState.mode === "bus" ? Infinity : alightCost[index] + (routeWaits[routeState.routeId] ?? 4);
+      bike && routeState.mode === "bus"
+        ? Infinity
+        : alightCost[index] + Math.max(0, (routeWaits[routeState.routeId] ?? 4) - (routeState.dwell ?? 0));
   });
 
   const heap = new MinHeap();
@@ -997,22 +1000,42 @@ function traceRoute(field, probePoint) {
 
 function buildRouteLegs(field, chain, end) {
   const nodeCount = state.graph.nodeCount;
-  const { routeStates, stations, routeStyles } = state.data;
+  const { routeStates, stations, routeStyles, meta, routeWaits } = state.data;
   const times = field.times;
+  const settings = currentTravelSettings();
+  const streetSpeed = field.bike ? settings.cyclingSpeed : settings.walkingSpeed;
+  const isStreet = (leg) => leg && (leg.type === "walk" || leg.type === "bike");
   const legs = [];
+  // Minutes spent getting out of a station; they belong to the street leg that follows.
+  let carriedMinutes = 0;
+
   const pushStreetLeg = (nodes, bike, startTime, endTime) => {
     if (nodes.length < 2) return;
     const points = nodes.map(streetNodePoint);
     const meters = polylineLength(points);
+    const minutes = endTime - startTime + carriedMinutes;
+    carriedMinutes = 0;
     const previousLeg = legs[legs.length - 1];
     if (previousLeg && previousLeg.type === (bike ? "bike" : "walk")) {
       previousLeg.points.push(...points.slice(1));
       previousLeg.meters += meters;
-      previousLeg.minutes += endTime - startTime;
+      previousLeg.minutes += minutes;
       return;
     }
-    legs.push({ type: bike ? "bike" : "walk", points, meters, minutes: endTime - startTime });
+    legs.push({ type: bike ? "bike" : "walk", points, meters, minutes });
   };
+
+  // Walking (or riding) from the street to the platform is part of the street leg before a ride.
+  const addStationAccess = (minutes) => {
+    const previousLeg = legs[legs.length - 1];
+    if (isStreet(previousLeg)) previousLeg.minutes += minutes;
+    else legs.push({ type: field.bike ? "bike" : "walk", points: [], meters: 0, minutes });
+  };
+
+  const stationAccessMinutes = (routeState) =>
+    routeState.linkMeters / streetSpeed +
+    (meta.stationAccessMinutes[routeState.mode] ?? 1.5) +
+    (field.bike ? meta.bikeStationExtraMinutes[routeState.mode] ?? 1 : 0);
 
   let index = 0;
   while (index < chain.length) {
@@ -1035,57 +1058,84 @@ function buildRouteLegs(field, chain, end) {
       index = runEnd + 1;
       continue;
     }
+
     // Transit run: consecutive (station, line) states until the traveller is back on the street.
+    // Rides are timed arrival-to-arrival, so a line's departure from a station is its arrival
+    // there plus its dwell; that split gives wait, ride, and change rows that add up to the total.
     let runEnd = index;
     while (runEnd + 1 < chain.length && chain[runEnd + 1] >= nodeCount) runEnd += 1;
-    const boardTime = index > 0 ? times[chain[index - 1]] : 0;
-    const exitTime = runEnd + 1 < chain.length ? times[chain[runEnd + 1]] : times[chain[runEnd]];
+    const firstState = routeStates[chain[index] - nodeCount];
+    const access = stationAccessMinutes(firstState);
+    const platformTime = (index > 0 ? times[chain[index - 1]] : 0) + access;
+    addStationAccess(access);
+
     let groupStart = index;
-    let legStartTime = boardTime;
+    let readyTime = platformTime; // when the traveller is on the platform for the next line
     for (let k = index; k <= runEnd; k += 1) {
-      const lastOfGroup = k === runEnd || routeStates[chain[k + 1] - nodeCount].routeId !== routeStates[chain[k] - nodeCount].routeId;
+      const lastOfGroup =
+        k === runEnd || routeStates[chain[k + 1] - nodeCount].routeId !== routeStates[chain[k] - nodeCount].routeId;
       if (!lastOfGroup) continue;
       const group = chain.slice(groupStart, k + 1).map((value) => routeStates[value - nodeCount]);
       const routeId = group[0].routeId;
+      const style = routeStyles[routeId] ?? {};
+      const label = style.label ?? routeId;
+      const departure = times[chain[groupStart]] + (group[0].dwell ?? 0);
+      const arrival = times[chain[k]];
       const stationIndexes = group.map((routeState) => routeState.stationIndex);
-      const legEndTime = k === runEnd ? exitTime : times[chain[k]];
+
+      if (groupStart === index) {
+        legs.push({ type: "wait", label, color: style.color, textColor: style.textColor, minutes: departure - readyTime });
+      } else {
+        legs.push({
+          type: "change",
+          label,
+          color: style.color,
+          textColor: style.textColor,
+          at: stations[stationIndexes[0]].name,
+          minutes: departure - readyTime,
+        });
+      }
+
       const points = [];
       for (let hop = 1; hop < stationIndexes.length; hop += 1) {
         const subpath = routeSubpath(routeId, stations[stationIndexes[hop - 1]].point, stations[stationIndexes[hop]].point);
         points.push(...(points.length ? subpath.slice(1) : subpath));
       }
-      if (stationIndexes.length > 1) {
-        legs.push({
-          type: "ride",
-          routeId,
-          label: routeStyles[routeId]?.label ?? routeId,
-          color: routeStyles[routeId]?.color ?? "#17304d",
-          textColor: routeStyles[routeId]?.textColor ?? "#ffffff",
-          from: stations[stationIndexes[0]].name,
-          to: stations[stationIndexes[stationIndexes.length - 1]].name,
-          stops: stationIndexes.length - 1,
-          stationPoints: [stations[stationIndexes[0]].point, stations[stationIndexes[stationIndexes.length - 1]].point],
-          points,
-          minutes: legEndTime - legStartTime,
-        });
-      }
+      legs.push({
+        type: "ride",
+        routeId,
+        label,
+        color: style.color ?? "#17304d",
+        textColor: style.textColor ?? "#ffffff",
+        from: stations[stationIndexes[0]].name,
+        to: stations[stationIndexes[stationIndexes.length - 1]].name,
+        stops: stationIndexes.length - 1,
+        stationPoints: [stations[stationIndexes[0]].point, stations[stationIndexes[stationIndexes.length - 1]].point],
+        points,
+        minutes: arrival - departure,
+      });
       groupStart = k + 1;
-      legStartTime = legEndTime;
+      readyTime = arrival;
     }
+
+    // Getting from the last platform back to the street goes into the next street leg.
+    const exitNode = runEnd + 1 < chain.length ? chain[runEnd + 1] : null;
+    carriedMinutes = exitNode !== null ? times[exitNode] - times[chain[runEnd]] : 0;
     index = runEnd + 1;
   }
 
   // The snap from the start pin onto the street network belongs to the first leg.
-  if (legs.length && legs[0].type !== "ride") legs[0].minutes += times[chain[0]];
+  if (isStreet(legs[0])) legs[0].minutes += times[chain[0]];
 
-  // The last few metres from the street network to the measure pin.
+  // The last few metres from the street network to the measure pin (plus any station exit time).
+  const walkSpeed = settings.walkingSpeed;
   const lastLeg = legs[legs.length - 1];
-  const walkSpeed = currentTravelSettings().walkingSpeed;
-  if (lastLeg && lastLeg.type === "walk") {
-    lastLeg.minutes += end.meters / walkSpeed;
+  const finalMinutes = end.meters / walkSpeed + carriedMinutes;
+  if (isStreet(lastLeg) && lastLeg.type === "walk") {
+    lastLeg.minutes += finalMinutes;
     lastLeg.meters += end.meters;
-  } else if (end.meters > 1) {
-    legs.push({ type: "walk", points: [streetNodePoint(end.node)], meters: end.meters, minutes: end.meters / walkSpeed });
+  } else if (finalMinutes > 0.01) {
+    legs.push({ type: "walk", points: [streetNodePoint(end.node)], meters: end.meters, minutes: finalMinutes });
   }
   return mergeShortStreetLegs(legs);
 }
@@ -1093,7 +1143,7 @@ function buildRouteLegs(field, chain, end) {
 // Fold short walk/bike fragments (e.g. pushing the bike across a plaza) into the neighbouring street
 // leg, so the itinerary reads "Bike 2.8 km" rather than alternating 40 m pieces.
 function mergeShortStreetLegs(legs) {
-  const isStreet = (leg) => leg && leg.type !== "ride";
+  const isStreet = (leg) => leg && (leg.type === "walk" || leg.type === "bike");
   let merged = true;
   while (merged) {
     merged = false;
@@ -1122,7 +1172,7 @@ function drawRoute(drawCtx, route, projectPoint) {
   drawCtx.lineCap = "round";
   drawCtx.lineJoin = "round";
   for (const leg of route.legs) {
-    if (leg.points.length < 2) continue;
+    if (!leg.points || leg.points.length < 2) continue;
     const screen = leg.points.map(projectPoint);
     const trace = () => {
       drawCtx.beginPath();
@@ -1170,7 +1220,9 @@ function formatMeters(meters) {
 }
 
 function renderRouteSteps(route) {
-  const key = route ? JSON.stringify(route.legs.map((leg) => [leg.type, leg.label, leg.from, leg.to, Math.round(leg.minutes), Math.round(leg.meters ?? 0)])) : "";
+  const key = route
+    ? JSON.stringify(route.legs.map((leg) => [leg.type, leg.label, leg.from, leg.to, leg.at, Math.round(leg.minutes), Math.round(leg.meters ?? 0)]))
+    : "";
   if (key === state.routeStepsKey) return;
   state.routeStepsKey = key;
   if (!route) {
@@ -1178,22 +1230,31 @@ function renderRouteSteps(route) {
     routeSteps.innerHTML = "";
     return;
   }
+  const lineChip = (leg) =>
+    `<span class="route-chip route-chip-line" style="background:${leg.color};color:${leg.textColor}">${escapeHtml(leg.label)}</span>`;
+  const row = (chip, text, minutes, approximate = false) => `<li>${chip}
+    <span class="route-text" title="${escapeHtml(text)}">${escapeHtml(text)}</span>
+    <span class="route-time">${approximate ? "~" : ""}${formatMinutes(minutes)}</span></li>`;
   const rows = route.legs
-    .map((leg) => {
+    .map((leg, index) => {
       if (leg.type === "ride") {
         const stops = `${leg.stops} stop${leg.stops === 1 ? "" : "s"}`;
-        return `<li><span class="route-chip" style="background:${leg.color};color:${leg.textColor}">${escapeHtml(leg.label)}</span>
-          <span class="route-text" title="${escapeHtml(`${leg.from} → ${leg.to} · ${stops}`)}">${escapeHtml(leg.from)} → ${escapeHtml(leg.to)} · ${stops}</span>
-          <span class="route-time">${formatMinutes(leg.minutes)}</span></li>`;
+        return row(lineChip(leg), `${leg.from} → ${leg.to} · ${stops}`, leg.minutes);
+      }
+      if (leg.type === "wait") {
+        return row('<span class="route-chip route-chip-pause">Wait</span>', `for ${leg.label}`, leg.minutes, true);
+      }
+      if (leg.type === "change") {
+        return row('<span class="route-chip route-chip-pause">Change</span>', `at ${leg.at} to ${leg.label}`, leg.minutes, true);
       }
       const label = leg.type === "bike" ? "Bike" : "Walk";
-      return `<li><span class="route-chip route-chip-${leg.type}">${label}</span>
-        <span class="route-text">${formatMeters(leg.meters)}</span>
-        <span class="route-time">${formatMinutes(leg.minutes)}</span></li>`;
+      const afterRide = route.legs[index - 1]?.type === "ride";
+      const distanceText = leg.meters < 5 ? (afterRide ? "from the platform" : "to the platform") : formatMeters(leg.meters);
+      return row(`<span class="route-chip route-chip-${leg.type}">${label}</span>`, distanceText, leg.minutes);
     })
     .join("");
   routeSteps.innerHTML = `<p class="route-total">Fastest route · <strong>${formatMinutes(route.total)}</strong></p><ol>${rows}</ol>
-    <p class="route-note">Ride times include waiting and getting to the platform.</p>`;
+    <p class="route-note">Walks include getting to and from platforms. Waits and changes are averages based on how often each line runs.</p>`;
   routeSteps.hidden = false;
 }
 

@@ -391,6 +391,7 @@ def build_transit(
                     "mode": network["routes"][route_id]["mode"],
                     "node": node,
                     "linkMeters": round(meters, 1),
+                    "dwell": station["dwell"].get(route_id, 0.0),
                 }
             )
         station_states.append(states)
@@ -411,12 +412,14 @@ def build_transit(
         b = state_index.get((to_station, route_id))
         if a is not None and b is not None and minutes < adjacency[a].get(b, math.inf):
             adjacency[a][b] = minutes
-    # In-station transfers: GTFS minimum transfer time plus the expected wait for the next line.
+    # In-station transfers: GTFS minimum transfer time plus the expected wait for the next line's
+    # departure. Rides are timed from arrival, so the next line's dwell there is taken back off.
     for station_index, station in enumerate(network["stations"]):
         for from_route, to_route, seconds in station["transfers"]:
             a = state_index[(station_index, from_route)]
             b = state_index[(station_index, to_route)]
-            adjacency[a][b] = round(seconds / 60.0 + waits.get(to_route, 4.0), 2)
+            wait = max(0.0, waits.get(to_route, 4.0) - station["dwell"].get(to_route, 0.0))
+            adjacency[a][b] = round(seconds / 60.0 + wait, 2)
 
     return (
         stations,

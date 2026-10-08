@@ -397,6 +397,12 @@ body {
   color: var(--ink);
 }
 
+.route-chip-pause {
+  background: transparent;
+  color: var(--muted);
+  border: 1px dashed rgba(23, 48, 77, 0.3);
+}
+
 .route-chip-bike {
   background: #2e8b57;
   color: #fff;

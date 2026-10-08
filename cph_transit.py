@@ -25,7 +25,7 @@ GTFS_DIR = ROOT / "GTFS"
 DATA_DIR = ROOT / "data"
 MUNICIPALITIES_PATH = DATA_DIR / "cph_municipalities.geojson"
 CACHE_PATH = DATA_DIR / "cph_transit_network.json"
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 
 MODES = [
     {"id": "metro", "label": "Metro", "color": "#E30613"},
@@ -82,6 +82,8 @@ STATION_BOUNDARY_BUFFER = 400.0
 
 SERVICE_WINDOW = (7 * 3600, 19 * 3600)
 MIN_EDGE_SECONDS = 20
+# Longer stops than this are layovers (e.g. a regional train waiting at København H), not dwell.
+MAX_DWELL_SECONDS = 10 * 60
 MAX_EDGE_SECONDS = 45 * 60
 MAX_SHAPES_PER_ROUTE_DIRECTION = 2
 SHAPE_CLIP_MARGIN_DEG = (0.03, 0.05)  # lat, lon
@@ -318,7 +320,11 @@ def build_network() -> dict:
         complexes[match]["stops"][stop_id] = stop["point"]
         stop_to_station[stop_id] = match
 
+    # Ride times are arrival-to-arrival, so time standing at stations a train passes through is
+    # included; the dwell at each (station, line) is kept so a ride is timed from its departure
+    # where you board (see "dwell" in the output and how the app subtracts it when boarding).
     durations: Dict[Tuple[int, int, str], List[float]] = defaultdict(list)
+    dwells: Dict[Tuple[int, str], List[float]] = defaultdict(list)
     departures: Dict[Tuple[str, int, int], int] = Counter()
     route_modes: Dict[str, str] = {}
     shape_counts: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
@@ -332,11 +338,13 @@ def build_network() -> dict:
         route_modes[route_key] = trip["mode"]
         if trip["shape_id"]:
             shape_counts[(route_key, trip["direction"])][trip["shape_id"]] += 1
-        for _, stop_id, _, _ in in_area:
+        for _, stop_id, arrival, departure in in_area:
             station = stop_to_station[stop_id]
             complexes[station]["routes"].add(route_key)
             complexes[station]["modes"].add(trip["mode"])
             complexes[station]["routeStops"][route_key][stop_id] += 1
+            if 0 <= departure - arrival <= MAX_DWELL_SECONDS:
+                dwells[(station, route_key)].append((departure - arrival) / 60.0)
         for prev, nxt in zip(in_area, in_area[1:]):
             from_station = stop_to_station[prev[1]]
             to_station = stop_to_station[nxt[1]]
@@ -344,7 +352,7 @@ def build_network() -> dict:
                 continue
             if SERVICE_WINDOW[0] <= prev[3] < SERVICE_WINDOW[1]:
                 departures[(route_key, from_station, to_station)] += 1
-            seconds = nxt[2] - prev[3]
+            seconds = nxt[2] - prev[2]
             if MIN_EDGE_SECONDS <= seconds <= MAX_EDGE_SECONDS:
                 durations[(from_station, to_station, route_key)].append(seconds / 60.0)
 
@@ -429,6 +437,10 @@ def build_network() -> dict:
                 },
                 "routeStops": route_stops,
                 "transfers": transfers,
+                "dwell": {
+                    route: round(statistics.median(dwells[(old, route)]), 2) if dwells.get((old, route)) else 0.0
+                    for route in route_stops
+                },
             }
         )
     edges = [
