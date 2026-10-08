@@ -17,7 +17,8 @@ const STREET_BUCKET_METERS = 100;
 const ORIGIN_SNAP_CANDIDATES = 3;
 // Stop expanding the search this many minutes past the colour scale's maximum.
 const SEARCH_CUTOFF_EXTRA_MINUTES = 30;
-const REACHABILITY_THRESHOLD_MINUTES = 60;
+// Always search at least this far, whatever the colour scale's maximum.
+const MIN_SEARCH_MINUTES = 60;
 const DEFAULT_DISABLED_MODES = ["bike"];
 const SHARE_COORDINATE_DECIMALS = 5;
 const METERS_PER_MINUTE_PER_KMH = 1000 / 60;
@@ -73,7 +74,6 @@ const searchMeta = document.getElementById("searchMeta");
 const searchResults = document.getElementById("searchResults");
 const locateButton = document.getElementById("locateButton");
 const clearButton = document.getElementById("clearButton");
-const reachScore = document.getElementById("reachScore");
 const routeSteps = document.getElementById("routeSteps");
 const routeButton = document.getElementById("routeButton");
 const modeToggleContainer = document.querySelector("[data-mode-toggles]");
@@ -807,7 +807,7 @@ function computeTravelField(originPoint) {
   if (state.fieldCache?.key === key) return state.fieldCache;
 
   const g = state.graph;
-  const { meta, routeStates, adjacency, routeWaits, stations } = state.data;
+  const { meta, routeStates, adjacency, routeWaits } = state.data;
   const settings = currentTravelSettings();
   const bike = bikeEnabled();
   const walkSpeed = settings.walkingSpeed;
@@ -816,7 +816,7 @@ function computeTravelField(originPoint) {
   const times = new Float64Array(nodeCount + routeStates.length).fill(Infinity);
   // Predecessor of each node on its fastest path, for drawing routes.
   const previous = new Int32Array(nodeCount + routeStates.length).fill(-1);
-  const cutoff = Math.max(REACHABILITY_THRESHOLD_MINUTES, settings.maxTransitTime) + SEARCH_CUTOFF_EXTRA_MINUTES;
+  const cutoff = Math.max(MIN_SEARCH_MINUTES, settings.maxTransitTime) + SEARCH_CUTOFF_EXTRA_MINUTES;
 
   const boardCost = new Float32Array(routeStates.length);
   const alightCost = new Float32Array(routeStates.length);
@@ -878,21 +878,6 @@ function computeTravelField(originPoint) {
     if (node >= 0) minutes[cell] = times[node] + g.cellSnapDm[cell] / 10 / walkSpeed;
   }
 
-  // 60-minute reach: enabled stations inside the map, timed at their street entrance.
-  let totalStations = 0;
-  let reachableStations = 0;
-  for (const stationIndex of state.enabledStationIndexes) {
-    if (!stations[stationIndex].inView) continue;
-    let best = Infinity;
-    for (const routeStateIndex of state.data.stationStates[stationIndex]) {
-      const node = routeStates[routeStateIndex].node;
-      if (node >= 0) best = Math.min(best, times[node]);
-    }
-    if (best === Infinity && !state.data.stationStates[stationIndex].some((index) => routeStates[index].node >= 0)) continue;
-    totalStations += 1;
-    if (best <= REACHABILITY_THRESHOLD_MINUTES) reachableStations += 1;
-  }
-
   const nearest = nearestEnabledStations(originPoint, 1)[0];
   state.fieldCache = {
     key,
@@ -902,11 +887,6 @@ function computeTravelField(originPoint) {
     minutes,
     heatImage: null,
     nearestStationIndex: nearest ? nearest.index : null,
-    reachability: {
-      reachableStations,
-      totalStations,
-      ratio: totalStations ? reachableStations / totalStations : 0,
-    },
   };
   return state.fieldCache;
 }
@@ -1532,39 +1512,6 @@ function exportShareImage() {
     );
   }
 
-  const reachability = field?.reachability ?? null;
-  if (reachability) {
-    const badgeX = mapX + 26;
-    const badgeY = mapY + 24;
-    const badgeWidth = 310;
-    const badgeHeight = 110;
-    const percent = Math.round(reachability.ratio * 100);
-
-    exportCtx.fillStyle = "rgba(255, 252, 247, 0.9)";
-    exportCtx.beginPath();
-    exportCtx.roundRect(badgeX, badgeY, badgeWidth, badgeHeight, 22);
-    exportCtx.fill();
-
-    exportCtx.strokeStyle = "rgba(23, 48, 77, 0.12)";
-    exportCtx.lineWidth = 1.5;
-    exportCtx.stroke();
-
-    exportCtx.fillStyle = "#5f6f7f";
-    exportCtx.font = '700 17px "Avenir Next", "Helvetica Neue", Helvetica, sans-serif';
-    exportCtx.fillText("60-MINUTE REACH", badgeX + 20, badgeY + 26);
-
-    exportCtx.fillStyle = "#17304d";
-    exportCtx.font = '700 42px "Avenir Next", "Helvetica Neue", Helvetica, sans-serif';
-    exportCtx.fillText(
-      `${reachability.reachableStations} / ${reachability.totalStations}`,
-      badgeX + 20,
-      badgeY + 68,
-    );
-
-    exportCtx.fillStyle = "#5f6f7f";
-    exportCtx.font = '500 18px "Avenir Next", "Helvetica Neue", Helvetica, sans-serif';
-    exportCtx.fillText(`${percent}% of stations within 60 min`, badgeX + 20, badgeY + 94);
-  }
   exportCtx.restore();
 
   if (state.showHeatmap) {
@@ -1823,8 +1770,6 @@ function drawMap(drawCtx, width, height) {
   const projectPoint = (point) => transform.toScreen(point);
   const field = state.originPoint && state.graph ? computeTravelField(state.originPoint) : null;
   state.currentRender = { field, transform, projectPoint };
-  syncReachabilityScore(field?.reachability ?? null);
-
   drawExternalLand(drawCtx, projectPoint);
   drawCityBasemap(drawCtx, projectPoint, transform);
   if (field && state.showHeatmap) {
@@ -1861,16 +1806,6 @@ function drawMap(drawCtx, width, height) {
     ? `Travel times from ${summary.replace(/^Near /, "near ")}.`
     : "Click the map (or search an address) to choose a starting point.";
   clearButton.hidden = !state.originPoint;
-}
-
-function syncReachabilityScore(summary) {
-  if (!summary || !summary.totalStations) {
-    reachScore.hidden = true;
-    return;
-  }
-  reachScore.hidden = false;
-  const percent = Math.round(summary.ratio * 100);
-  reachScore.innerHTML = `<strong>${summary.reachableStations} / ${summary.totalStations}</strong> stations (${percent}%) reachable within ${REACHABILITY_THRESHOLD_MINUTES} min`;
 }
 
 // ---------- pins, panning, zooming ----------

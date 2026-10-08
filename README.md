@@ -130,8 +130,6 @@ Moves between them:
 With Bike on, the bike comes along on every transit leg. In reality bikes are not allowed on the Metro on
 weekdays 07–09 and 15:30–17:30, and need a ticket on regional trains.
 
-The 60-minute reach score counts stations served by the currently enabled modes.
-
 Some UI/share icons are from [Iconmonstr](https://iconmonstr.com/).
 
 ## Project Layout

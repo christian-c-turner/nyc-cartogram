@@ -399,7 +399,6 @@ def build_transit(
                 "point": round_point(point),
                 "routes": station["routes"],
                 "modes": station["modes"],
-                "inView": bounds[0] <= point[0] <= bounds[2] and bounds[1] <= point[1] <= bounds[3],
             }
         )
 
