@@ -496,6 +496,7 @@ def main() -> None:
                 cell_node[row * cols + col] = node
                 cell_snap[row * cols + col] = min(65535, round(meters * 10))
 
+    SITE_DATA_DIR.mkdir(parents=True, exist_ok=True)
     offsets = array("I", [0])
     targets = array("I")
     lengths = array("B")
@@ -556,7 +557,6 @@ def main() -> None:
         "routeStyles": network["routes"],
     }
 
-    SITE_DATA_DIR.mkdir(parents=True, exist_ok=True)
     SITE_DATA_PATH.write_text(json.dumps(output, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     print(f"Wrote {SITE_DATA_PATH} and {SITE_GRAPH_PATH}")
     print(f"  grid {cols}x{rows} ({CELL_METERS:.0f} m), {land_cells} land cells")
