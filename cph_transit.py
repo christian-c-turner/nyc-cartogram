@@ -25,7 +25,7 @@ GTFS_DIR = ROOT / "GTFS"
 DATA_DIR = ROOT / "data"
 MUNICIPALITIES_PATH = DATA_DIR / "cph_municipalities.geojson"
 CACHE_PATH = DATA_DIR / "cph_transit_network.json"
-CACHE_VERSION = 3
+CACHE_VERSION = 5
 
 MODES = [
     {"id": "metro", "label": "Metro", "color": "#E30613"},
@@ -33,9 +33,18 @@ MODES = [
     {"id": "letbane", "label": "Letbane", "color": "#5E6F82"},
     {"id": "regional", "label": "Regional trains", "color": "#7C3A5E"},
     {"id": "harbour", "label": "Harbour bus", "color": "#4FB3BF"},
+    # Dark amber: Movia's yellow would clash with the F line and M2.
+    {"id": "bus", "label": "Bus", "color": "#A8661C"},
 ]
 # Draw order (first = bottom): long-distance lines underneath, metro on top.
-MODE_DRAW_ORDER = ("regional", "harbour", "stog", "letbane", "metro")
+MODE_DRAW_ORDER = ("bus", "regional", "harbour", "stog", "letbane", "metro")
+# Movia's buses (route_type 3) and S-buses (700). Rail-replacement buses run by DSB and the Metro
+# are left out, as are demand-responsive services (715).
+BUS_AGENCIES = {"Movia"}
+BUS_ROUTE_TYPES = {"3", "700"}
+BUS_ROUTE_PREFIX = "bus:"
+# Bus stops with the same name this close together (usually the two sides of the street) form one stop.
+BUS_STOP_MERGE_RADIUS = 150.0
 
 ROUTE_COLORS = {
     "M1": "#00814F",
@@ -161,7 +170,7 @@ class Area:
 
 
 def classify_route(row: dict, agency_names: Dict[str, str]) -> Tuple[str, str] | None:
-    """Return (mode, route key) for routes we model, or None for buses and others."""
+    """Return (mode, route key) for routes we model, or None for everything else."""
     route_type = row["route_type"]
     short_name = (row.get("route_short_name") or "").strip()
     agency = agency_names.get(row.get("agency_id", ""), "")
@@ -175,6 +184,8 @@ def classify_route(row: dict, agency_names: Dict[str, str]) -> Tuple[str, str] |
         return "regional", REGIONAL_ROUTE_NAMES.get(agency, agency or short_name)
     if route_type == "4":
         return "harbour", "Havnebus"
+    if route_type in BUS_ROUTE_TYPES and agency in BUS_AGENCIES and short_name:
+        return "bus", BUS_ROUTE_PREFIX + short_name
     return None
 
 
@@ -265,26 +276,35 @@ def build_network() -> dict:
                 parse_gtfs_time(row["departure_time"]),
             )
         )
-    used_stop_ids = {stop_id for rows in stop_times.values() for _, stop_id, _, _ in rows}
+    stop_modes: Dict[str, set] = defaultdict(set)
+    for trip_id, rows in stop_times.items():
+        for _, stop_id, _, _ in rows:
+            stop_modes[stop_id].add(trips[trip_id]["mode"])
 
     stops: Dict[str, dict] = {}
     for row in read_csv("stops.txt"):
-        if row["stop_id"] not in used_stop_ids:
+        if row["stop_id"] not in stop_modes:
             continue
         point = (float(row["stop_lon"]), float(row["stop_lat"]))
         if area.serves(point):
-            stops[row["stop_id"]] = {"name": normalize_station_name(row["stop_name"]), "point": point}
+            bus_only = stop_modes[row["stop_id"]] == {"bus"}
+            # Bus stops keep their full name ("Nørreport St. (Nørre Voldgade)") and are never merged
+            # into a rail station; rail platforms merge by their normalized name.
+            name = re.sub(r"\s+", " ", row["stop_name"]).strip() if bus_only else normalize_station_name(row["stop_name"])
+            stops[row["stop_id"]] = {"name": name, "point": point, "bus": bus_only}
 
-    # Group stops into station complexes: same normalized name, close together.
+    # Group stops into station complexes: same name, close together.
     complexes: List[dict] = []
     stop_to_station: Dict[str, int] = {}
-    by_name: Dict[str, List[int]] = defaultdict(list)
+    by_name: Dict[Tuple[bool, str], List[int]] = defaultdict(list)
     for stop_id, stop in sorted(stops.items()):
+        group = (stop["bus"], stop["name"])
+        radius = BUS_STOP_MERGE_RADIUS if stop["bus"] else STATION_MERGE_RADIUS
         match = next(
             (
                 index
-                for index in by_name[stop["name"]]
-                if meters_between(complexes[index]["points"][0], stop["point"]) <= STATION_MERGE_RADIUS
+                for index in by_name[group]
+                if meters_between(complexes[index]["points"][0], stop["point"]) <= radius
             ),
             None,
         )
@@ -293,7 +313,7 @@ def build_network() -> dict:
             complexes.append(
                 {"name": stop["name"], "points": [], "stops": {}, "routes": set(), "modes": set(), "routeStops": defaultdict(Counter)}
             )
-            by_name[stop["name"]].append(match)
+            by_name[group].append(match)
         complexes[match]["points"].append(stop["point"])
         complexes[match]["stops"][stop_id] = stop["point"]
         stop_to_station[stop_id] = match
@@ -339,6 +359,16 @@ def build_network() -> dict:
         route_key: round(clamp(statistics.median(values) / 2.0, MIN_WAIT, MAX_WAIT), 2)
         for route_key, values in headways.items()
     }
+
+    # Routes with no regular daytime service (night buses, a few peak-only extras) would otherwise
+    # look available all day with a guessed wait; leave them out.
+    for station in complexes:
+        station["routes"] &= route_waits.keys()
+        station["modes"] = {route_modes[route] for route in station["routes"]}
+        station["routeStops"] = {route: stops_ for route, stops_ in station["routeStops"].items() if route in route_waits}
+    durations = {key: values for key, values in durations.items() if key[2] in route_waits}
+    route_modes = {route: mode for route, mode in route_modes.items() if route in route_waits}
+    shape_counts = {key: counter for key, counter in shape_counts.items() if key[0] in route_waits}
 
     # Minimum platform-to-platform transfer times from transfers.txt (seconds). Line-specific
     # rows (e.g. cross-platform S-tog changes) take precedence over stop-level ones.
@@ -442,9 +472,10 @@ def build_network() -> dict:
     routes = {}
     for route_key, mode in sorted(route_modes.items()):
         mode_color = next(m["color"] for m in MODES if m["id"] == mode)
+        is_bus = mode == "bus"
         routes[route_key] = {
             "mode": mode,
-            "label": route_key,
+            "label": route_key[len(BUS_ROUTE_PREFIX):] if is_bus else route_key,
             "color": ROUTE_COLORS.get(route_key, mode_color),
             "textColor": ROUTE_TEXT_COLORS.get(route_key, "#FFFFFF"),
         }

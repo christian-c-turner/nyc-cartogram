@@ -11,6 +11,9 @@ const PIN_HIT_RADIUS = 16;
 const CLICK_SLOP_PX = 4;
 const HEATMAP_ALPHA = 0.8;
 const HEATMAP_SHORE_SPREAD_CELLS = 2;
+// Where the colour scale is pure yellow, as a fraction of the maximum time (marked on the legend).
+const HEATMAP_YELLOW_STOP = 0.4;
+const BUS_STOP_MAX_METERS_PER_PX = 6;
 const MINOR_STREET_MAX_METERS_PER_PX = 8;
 const STREET_LAYER_MARGIN = 0.3;
 const STREET_BUCKET_METERS = 100;
@@ -86,6 +89,8 @@ const hintBar = document.getElementById("hintBar");
 const heatmapLegend = document.getElementById("heatmapLegend");
 const heatmapLegendMin = document.getElementById("heatmapLegendMin");
 const heatmapLegendMax = document.getElementById("heatmapLegendMax");
+const heatmapLegendMid = document.getElementById("heatmapLegendMid");
+const cursorReadout = document.getElementById("cursorReadout");
 const zoomInButton = document.getElementById("zoomInButton");
 const zoomOutButton = document.getElementById("zoomOutButton");
 const resetViewButton = document.getElementById("resetViewButton");
@@ -201,6 +206,7 @@ function syncHeatmapLegend() {
   heatmapLegend.hidden = !state.showHeatmap;
   heatmapLegendMin.textContent = "0m";
   heatmapLegendMax.textContent = `${Math.round(maxTransitTime)}m`;
+  heatmapLegendMid.textContent = `${Math.round(maxTransitTime * HEATMAP_YELLOW_STOP)}m`;
 }
 
 // ---------- geometry, formatting, URLs ----------
@@ -318,7 +324,7 @@ function heatmapRgb(minutes) {
   const stops = [
     { t: 0, color: [220, 69, 37] },
     { t: 0.2, color: [244, 127, 46] },
-    { t: 0.4, color: [255, 196, 79] },
+    { t: HEATMAP_YELLOW_STOP, color: [255, 196, 79] },
     { t: 0.62, color: [248, 232, 156] },
     { t: 0.8, color: [149, 188, 211] },
     { t: 1, color: [74, 103, 141] },
@@ -487,8 +493,10 @@ function drawCityBasemap(drawCtx, projectPoint, transform) {
   }
 
   // Lines for switched-off modes stay as faint context underneath the active network.
-  const disabledRoutes = state.data.routes.filter((route) => !isRouteEnabled(route.routeId));
-  const enabledRoutes = state.data.routes.filter((route) => isRouteEnabled(route.routeId));
+  // Bus lines are left off the basemap (there are ~100 of them); they show up in drawn routes.
+  const railRoutes = state.data.routes.filter((route) => route.mode !== "bus");
+  const disabledRoutes = railRoutes.filter((route) => !isRouteEnabled(route.routeId));
+  const enabledRoutes = railRoutes.filter((route) => isRouteEnabled(route.routeId));
   for (const route of [...disabledRoutes, ...enabledRoutes]) {
     drawCtx.save();
     if (!isRouteEnabled(route.routeId)) drawCtx.globalAlpha = DISABLED_ROUTE_ALPHA;
@@ -511,11 +519,14 @@ function drawCityBasemap(drawCtx, projectPoint, transform) {
 }
 
 function drawStations(drawCtx, projectPoint) {
+  const showBusStops = state.transform && 1 / state.transform.scale <= BUS_STOP_MAX_METERS_PER_PX;
   for (const [index, station] of state.data.stations.entries()) {
+    const busOnly = station.modes.length === 1 && station.modes[0] === "bus";
+    if (busOnly && (!showBusStops || state.stationEnabled?.[index] === false)) continue;
     const [sx, sy] = projectPoint(station.point);
-    drawCtx.globalAlpha = state.stationEnabled?.[index] === false ? DISABLED_ROUTE_ALPHA * 2 : 1;
+    drawCtx.globalAlpha = state.stationEnabled?.[index] === false ? DISABLED_ROUTE_ALPHA * 2 : busOnly ? 0.7 : 1;
     drawCtx.beginPath();
-    drawCtx.arc(sx, sy, 1.35, 0, Math.PI * 2);
+    drawCtx.arc(sx, sy, busOnly ? 1.1 : 1.35, 0, Math.PI * 2);
     drawCtx.fillStyle = "#ffffff";
     drawCtx.fill();
     drawCtx.lineWidth = 0.55;
@@ -589,9 +600,11 @@ function persistModes() {
   }
 }
 
-function nearestEnabledStations(point, count) {
+function nearestEnabledStations(point, count, { railOnly = false } = {}) {
   const best = [];
   for (const index of state.enabledStationIndexes) {
+    const modes = state.data.stations[index].modes;
+    if (railOnly && modes.length === 1 && modes[0] === "bus") continue;
     const meters = distance(point, state.data.stations[index].point);
     if (best.length === count && meters >= best[best.length - 1].distance) continue;
     let insertAt = best.length;
@@ -641,15 +654,6 @@ function applyEnabledModes(nextModes, { persist = true } = {}) {
   if (persist) persistModes();
   state.dirty = true;
   requestDraw();
-}
-
-function nearestStations(point, count) {
-  const settings = currentTravelSettings();
-  return nearestEnabledStations(point, count).map(({ index, distance: meters }) => ({
-    index,
-    name: state.data.stations[index].name,
-    walkMinutes: meters / settings.walkingSpeed,
-  }));
 }
 
 // ---------- street graph + multimodal routing ----------
@@ -824,7 +828,9 @@ function computeTravelField(originPoint) {
     const platform =
       (meta.stationAccessMinutes[routeState.mode] ?? 1.5) + (bike ? meta.bikeStationExtraMinutes[routeState.mode] ?? 1 : 0);
     alightCost[index] = routeState.linkMeters / streetSpeed + platform;
-    boardCost[index] = alightCost[index] + (routeWaits[routeState.routeId] ?? 4);
+    // Movia doesn't take bikes on buses, so with the bike on they can't be boarded.
+    boardCost[index] =
+      bike && routeState.mode === "bus" ? Infinity : alightCost[index] + (routeWaits[routeState.routeId] ?? 4);
   });
 
   const heap = new MinHeap();
@@ -878,7 +884,8 @@ function computeTravelField(originPoint) {
     if (node >= 0) minutes[cell] = times[node] + g.cellSnapDm[cell] / 10 / walkSpeed;
   }
 
-  const nearest = nearestEnabledStations(originPoint, 1)[0];
+  const nearest =
+    nearestEnabledStations(originPoint, 1, { railOnly: true })[0] ?? nearestEnabledStations(originPoint, 1)[0];
   state.fieldCache = {
     key,
     times,
@@ -1884,8 +1891,10 @@ function handlePointerMove(event) {
   if (!drag) {
     state.hoverPin = hitPin(screenPoint);
     syncCursor();
+    syncCursorReadout(screenPoint, worldPoint);
     return;
   }
+  syncCursorReadout(null);
   if (Math.hypot(screenPoint[0] - drag.startScreen[0], screenPoint[1] - drag.startScreen[1]) > CLICK_SLOP_PX) {
     drag.moved = true;
   }
@@ -1923,6 +1932,19 @@ function handlePointerUp(event) {
   syncBrowserUrl();
   syncCursor();
   invalidate();
+}
+
+// A faint travel-time readout that follows the cursor while hovering.
+function syncCursorReadout(screenPoint, worldPoint = null) {
+  const field = state.currentRender?.field;
+  const minutes = screenPoint && field && worldPoint && withinBounds(worldPoint) ? measureProbe(field, worldPoint) : NaN;
+  if (!Number.isFinite(minutes)) {
+    cursorReadout.hidden = true;
+    return;
+  }
+  cursorReadout.textContent = `${Math.round(minutes)}min.`;
+  cursorReadout.style.transform = `translate(${screenPoint[0] + 14}px, ${screenPoint[1] + 12}px)`;
+  cursorReadout.hidden = false;
 }
 
 function isTypingTarget(target) {
@@ -2141,6 +2163,7 @@ async function init() {
   mapCanvas.addEventListener("pointerleave", () => {
     state.hoverPin = null;
     syncCursor();
+    syncCursorReadout(null);
   });
   mapCanvas.addEventListener(
     "wheel",

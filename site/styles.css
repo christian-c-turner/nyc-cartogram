@@ -492,7 +492,7 @@ body {
   align-items: center;
   gap: 8px;
   width: 260px;
-  padding: 7px 12px;
+  padding: 7px 12px 21px;
   border-radius: 10px;
   border: 1px solid var(--line);
   background: var(--panel);
@@ -509,10 +509,51 @@ body {
 }
 
 .legend-scale {
+  position: relative;
   flex: 1 1 auto;
   height: 10px;
   border-radius: 999px;
   background: linear-gradient(90deg, #dc4525 0%, #f47f2e 20%, #ffc44f 40%, #f8e89c 62%, #95bcd3 80%, #4a678d 100%);
+}
+
+/* Marks the pure-yellow point of the scale (HEATMAP_YELLOW_STOP in app.js). */
+.legend-tick {
+  position: absolute;
+  left: 40%;
+  top: -3px;
+  width: 2px;
+  height: 16px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--ink);
+}
+
+.legend .legend-tick span {
+  position: absolute;
+  top: 17px;
+  left: 50%;
+  transform: translateX(-50%);
+  min-width: 0;
+  font-size: 0.7rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.cursor-readout {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: rgba(23, 48, 77, 0.6);
+  text-shadow: 0 0 3px rgba(255, 255, 255, 0.85);
+  white-space: nowrap;
+}
+
+.cursor-readout[hidden] {
+  display: none;
 }
 
 .tool-buttons {

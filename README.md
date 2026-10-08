@@ -16,18 +16,19 @@ Rødovre, Hvidovre, Glostrup, Brøndby, Albertslund, Vallensbæk, Ishøj, Høje-
 on central Copenhagen out to Rødovre (`INITIAL_VIEW_BBOX` in `build_commute_site_data.py`); pan and zoom
 to see the rest.
 
-Modes (each can be switched on/off in the app's Settings):
+Modes (each can be switched on/off in the options box):
 
 | Mode | Lines | Default |
 | --- | --- | --- |
-| Bike | the OSM cycling network; the bike comes along on transit | off |
+| Bike | the OSM cycling network; the bike comes along on trains, Metro, Letbane, and harbour buses (not on Movia buses) | off |
 | Metro | M1, M2, M3, M4 | on |
 | S-tog | A, B, Bx, C, E, F, H | on |
 | Letbane | Ring 3 light rail (L) | on |
 | Regional trains | DSB (IC, ICL, RE, …), Øresundståg, Lokaltog (Nærumbanen), Snälltåget | on |
 | Harbour bus | Movia 991/992/993 | on |
+| Bus | Movia buses and S-buses with daytime service (~96 routes, ~2,000 stops); night buses and rail-replacement buses are left out | on |
 
-Walking is always available. Buses are not modelled.
+Walking is always available. Bus times are scheduled times, so rush-hour traffic isn't reflected.
 
 ## Quick Start (fresh clone)
 
@@ -62,7 +63,7 @@ python3 build_commute_site_data.py
 python3 generate_cph_transit_weighted_projection.py
 ```
 
-`cph_transit.py` filters the national GTFS feed down to the Copenhagen rail and harbour-bus network and
+`cph_transit.py` filters the national GTFS feed down to the Copenhagen rail, bus, and harbour-bus network and
 caches it in `data/cph_transit_network.json`; the cache is rebuilt automatically when `GTFS/` changes.
 `cph_streets.py` turns the raw OSM extract into the routable street graph.
 

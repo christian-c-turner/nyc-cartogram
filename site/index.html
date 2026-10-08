@@ -90,7 +90,9 @@
       <div class="map-tools">
         <div id="heatmapLegend" class="legend">
           <span id="heatmapLegendMin">0m</span>
-          <div class="legend-scale" aria-hidden="true"></div>
+          <div class="legend-scale" aria-hidden="true">
+            <span class="legend-tick"><span id="heatmapLegendMid">24m</span></span>
+          </div>
           <span id="heatmapLegendMax">60m</span>
         </div>
         <div class="tool-buttons">
@@ -111,6 +113,7 @@
         </div>
       </div>
 
+      <div id="cursorReadout" class="cursor-readout" aria-hidden="true" hidden></div>
       <p id="toast" class="toast" role="status" hidden></p>
 
       <footer class="credits">

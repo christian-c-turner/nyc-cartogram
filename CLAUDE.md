@@ -57,9 +57,11 @@ python3 serve.py 8080      # all interfaces; handles /@lat,lon share links
 - **The GTFS URL moved or 404s:** find the current link on Rejseplanen Labs (rejseplanen.info/labs),
   update `GTFS_URL` in `setup_data.py`, and run `python3 setup_data.py --refresh-gtfs`. Any GTFS feed
   covering Copenhagen with Rejseplanen's route types should work. `cph_transit.py` relies on:
-  - `route_type` 1 = Metro, 109 = S-tog, 0 = light rail, 2 = regional rail, 4 = ferry;
+  - `route_type` 1 = Metro, 109 = S-tog, 0 = light rail, 2 = regional rail, 4 = ferry, and 3/700 = bus
+    (only agency "Movia", see `BUS_AGENCIES`);
   - the agency names in `REGIONAL_ROUTE_NAMES` for merging regional operators;
-  - stop names like "Nørreport St." / "Nørreport St. (Metro)" for merging platforms into stations.
+  - stop names like "Nørreport St." / "Nørreport St. (Metro)" for merging rail platforms into stations
+    (bus stops keep their own names and only merge with a same-named stop across the street).
 - **Few or no trips** (empty heatmap, "0 / 0 stations"): the feed's calendar may not overlap. The
   service date is picked automatically as the busiest weekday in the feed; check the
   `service date …` line printed while extracting the transit network.

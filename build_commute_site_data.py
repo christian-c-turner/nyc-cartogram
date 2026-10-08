@@ -45,8 +45,9 @@ MAX_CELL_SNAP_METERS = 6_000.0
 
 # Minutes from the street to the platform (and back), per mode. Deep metro and mainline stations
 # take longer than street-level light rail and harbour-bus stops. Bikes add lift/ramp time.
-STATION_ACCESS_MINUTES = {"metro": 2.0, "stog": 1.5, "regional": 2.0, "letbane": 0.5, "harbour": 0.5}
-BIKE_STATION_EXTRA_MINUTES = {"metro": 1.0, "stog": 1.0, "regional": 1.0, "letbane": 0.5, "harbour": 0.5}
+STATION_ACCESS_MINUTES = {"metro": 2.0, "stog": 1.5, "regional": 2.0, "letbane": 0.5, "harbour": 0.5, "bus": 0.3}
+# Bikes aren't allowed on Movia buses, so the app never boards a bus with the bike mode on.
+BIKE_STATION_EXTRA_MINUTES = {"metro": 1.0, "stog": 1.0, "regional": 1.0, "letbane": 0.5, "harbour": 0.5, "bus": 0.0}
 
 BIKE_MODE = {"id": "bike", "label": "Bike", "color": "#2E8B57"}
 
@@ -314,7 +315,8 @@ def build_route_shapes(network: dict, lat0: float, bounds: BBox) -> list:
     shapes = []
     for shape in network["shapes"]:
         route = network["routes"][shape["route"]]
-        points = simplify_polyline([lonlat_to_xy(lon, lat, lat0) for lon, lat in shape["lonlat"]], 30.0)
+        tolerance = 45.0 if route["mode"] == "bus" else 30.0
+        points = simplify_polyline([lonlat_to_xy(lon, lat, lat0) for lon, lat in shape["lonlat"]], tolerance)
         if len(points) < 2 or not bbox_intersects(bounds_of_points(points), visible):
             continue
         shapes.append(
