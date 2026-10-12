@@ -82,12 +82,13 @@ Using the map (shown in the hint bar at the bottom of the app):
 - the first click sets the **start pin**; after that it only moves when you drag it (or search an address)
 - any other click drops the **measure pin** there (or jumps it), showing the travel time to that spot;
   drag it to explore, click it or press Esc to remove it
-- hold **Space** and drag to pan; scroll to zoom
+- drag the map to pan; scroll to zoom
 - modes, the colour scale's maximum time (10–120 min), and the heatmap/outline layers are in the
   top-right box
-- **Show route** (next to Reset options) draws the fastest path from the start pin to the measure pin:
-  walking dashed, cycling in green, and each transit ride along that line's GTFS shape in its colour,
-  with a step-by-step itinerary in the top-left panel
+- the route (on by default; **Hide route** next to Reset options turns it off) draws the fastest path
+  from the start pin to the measure pin: walking dashed, cycling in green, and each transit ride along
+  that line's GTFS shape in its colour, with a step-by-step itinerary in the top-left panel;
+  **Trip details** there expands it to time per activity and every stop with its elapsed time
 
 ## Cloudflare Worker (optional)
 

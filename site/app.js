@@ -1,6 +1,6 @@
 const DATA_URL = new URL("./data/commute_map_data.json", import.meta.url).toString();
 const GRAPH_URL = new URL("./data/street_graph.bin", import.meta.url).toString();
-const DEFAULT_MAX_TIME_MINUTES = 60;
+const DEFAULT_MAX_TIME_MINUTES = 30;
 const MIN_VIEWPORT_SCALE = 1;
 const MAX_VIEWPORT_SCALE = 16;
 const VIEWPORT_ZOOM_STEP = 1.4;
@@ -25,7 +25,7 @@ const MIN_SEARCH_MINUTES = 60;
 const DEFAULT_DISABLED_MODES = ["bike"];
 const SHARE_COORDINATE_DECIMALS = 5;
 const METERS_PER_MINUTE_PER_KMH = 1000 / 60;
-const SETTINGS_STORAGE_KEY = "cph-cartogram-settings-v1";
+const SETTINGS_STORAGE_KEY = "cph-cartogram-settings-v2";
 const MODES_STORAGE_KEY = "cph-cartogram-modes-v1";
 const DISABLED_ROUTE_ALPHA = 0.16;
 const WATER_COLOR = "#d9e6ee";
@@ -39,9 +39,10 @@ const state = {
   ready: false,
   showHeatmap: true,
   showReachOutline: false,
-  showRoute: false,
+  showRoute: true,
   routeCache: null,
   routeStepsKey: "",
+  tripDetailsOpen: false,
   shapesByRoute: null,
   canvasSize: null,
   viewportScale: 1,
@@ -53,7 +54,6 @@ const state = {
   probePoint: null,
   drag: null,
   hoverPin: null,
-  spaceHeld: false,
   currentRender: null,
   travelSettings: null,
   travelSettingsDefaults: null,
@@ -78,14 +78,15 @@ const searchResults = document.getElementById("searchResults");
 const locateButton = document.getElementById("locateButton");
 const clearButton = document.getElementById("clearButton");
 const routeSteps = document.getElementById("routeSteps");
+const credits = document.getElementById("credits");
 const routeButton = document.getElementById("routeButton");
+const tripDetailsButton = document.getElementById("tripDetailsButton");
 const modeToggleContainer = document.querySelector("[data-mode-toggles]");
 const settingsInputs = Array.from(document.querySelectorAll("[data-setting-key]"));
 const settingsValueLabels = Array.from(document.querySelectorAll("[data-setting-value]"));
 const resetSettingsButton = document.getElementById("resetSettingsButton");
 const heatmapToggle = document.getElementById("heatmapToggle");
 const outlineToggle = document.getElementById("outlineToggle");
-const hintBar = document.getElementById("hintBar");
 const heatmapLegend = document.getElementById("heatmapLegend");
 const heatmapLegendMin = document.getElementById("heatmapLegendMin");
 const heatmapLegendMax = document.getElementById("heatmapLegendMax");
@@ -1110,6 +1111,11 @@ function buildRouteLegs(field, chain, end) {
         from: stations[stationIndexes[0]].name,
         to: stations[stationIndexes[stationIndexes.length - 1]].name,
         stops: stationIndexes.length - 1,
+        // Minutes since leaving the start pin: departure from the first station, arrival at the rest.
+        stopTimes: stationIndexes.map((stationIndex, offset) => ({
+          name: stations[stationIndex].name,
+          minutes: offset === 0 ? departure : times[chain[groupStart + offset]],
+        })),
         stationPoints: [stations[stationIndexes[0]].point, stations[stationIndexes[stationIndexes.length - 1]].point],
         points,
         minutes: arrival - departure,
@@ -1221,10 +1227,14 @@ function formatMeters(meters) {
 
 function renderRouteSteps(route) {
   const key = route
-    ? JSON.stringify(route.legs.map((leg) => [leg.type, leg.label, leg.from, leg.to, leg.at, Math.round(leg.minutes), Math.round(leg.meters ?? 0)]))
+    ? JSON.stringify([
+        state.originLabel,
+        route.legs.map((leg) => [leg.type, leg.label, leg.from, leg.to, leg.at, Math.round(leg.minutes), Math.round(leg.meters ?? 0)]),
+      ])
     : "";
   if (key === state.routeStepsKey) return;
   state.routeStepsKey = key;
+  tripDetailsButton.hidden = !route;
   if (!route) {
     routeSteps.hidden = true;
     routeSteps.innerHTML = "";
@@ -1253,9 +1263,104 @@ function renderRouteSteps(route) {
       return row(`<span class="route-chip route-chip-${leg.type}">${label}</span>`, distanceText, leg.minutes);
     })
     .join("");
-  routeSteps.innerHTML = `<p class="route-total">Fastest route · <strong>${formatMinutes(route.total)}</strong></p><ol>${rows}</ol>
-    <p class="route-note">Walks include getting to and from platforms. Waits and changes are averages based on how often each line runs.</p>`;
+  // The brief list and the full breakdown are both rendered; "Trip details" switches between them.
+  routeSteps.innerHTML = `${routeTimeBar(route)}<p class="route-total">Fastest route · <strong>${formatMinutes(route.total)}</strong></p>
+    <ol class="route-brief">${rows}</ol>
+    <div class="trip-details">${tripDetailsHtml(route)}</div>
+    <p class="route-note"><span class="trip-details-only">Left column: minutes since leaving the start pin. </span>Walks include getting to and from platforms. Waits and changes are averages based on how often each line runs.</p>`;
   routeSteps.hidden = false;
+  syncTripDetailsToggle();
+}
+
+// One segment per leg, sized by its minutes: walks navy, bike green, rides in their line colour,
+// waits and changes hatched.
+function routeTimeBar(route) {
+  const legColor = (leg) =>
+    leg.type === "ride" ? leg.color : leg.type === "bike" ? BIKE_ROUTE_COLOR : leg.type === "walk" ? "#17304d" : null;
+  const segments = route.legs
+    .filter((leg) => leg.minutes > 0)
+    .map((leg) => {
+      const color = legColor(leg);
+      const style = `flex-grow:${leg.minutes.toFixed(3)}${color ? `;background:${color}` : ""}`;
+      return `<span class="trip-bar-segment trip-bar-${leg.type}" style="${style}"></span>`;
+    })
+    .join("");
+  return `<div class="trip-bar" aria-hidden="true">${segments}</div>`;
+}
+
+const TRIP_CATEGORIES = [
+  { type: "walk", label: "Walking" },
+  { type: "bike", label: "Cycling" },
+  { type: "wait", label: "Waiting" },
+  { type: "ride", label: "Riding" },
+  { type: "change", label: "Changing" },
+];
+
+// The full itinerary behind the "Trip details" button: minutes per activity, and every step
+// (including each stop along a ride) with the minutes elapsed since leaving the start pin.
+function tripDetailsHtml(route) {
+  const legs = route.legs;
+  const total = route.total;
+  // A single line colours its own swatch; several lines share the accent colour.
+  const rideColors = new Set(legs.filter((leg) => leg.type === "ride").map((leg) => leg.color));
+  const summary = TRIP_CATEGORIES.map(({ type, label }) => {
+    const minutes = legs.filter((leg) => leg.type === type).reduce((sum, leg) => sum + leg.minutes, 0);
+    if (minutes <= 0) return "";
+    const share = total > 0 ? Math.round((minutes / total) * 100) : 0;
+    const swatchStyle = type === "ride" && rideColors.size === 1 ? ` style="background:${[...rideColors][0]}"` : "";
+    return `<li><span class="trip-swatch trip-swatch-${type}"${swatchStyle}></span><span>${label}</span>
+      <span class="trip-share">${share}%</span><strong>${formatMinutes(minutes)}</strong></li>`;
+  }).join("");
+
+  const placeName = (leg) => (leg?.type === "ride" ? leg.from : null);
+  const nextRide = (index) => legs.slice(index + 1).find((leg) => leg.type === "ride");
+  const step = (elapsed, title, detail, minutes, extra = "") => `<li>
+      <span class="trip-clock">${Math.round(elapsed)} min</span>
+      <span class="trip-step"><strong>${title}</strong>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}${extra}</span>
+      <span class="trip-duration">${minutes === null ? "" : formatMinutes(minutes)}</span></li>`;
+
+  let elapsed = 0;
+  const steps = [step(0, "Start", state.originLabel ?? "Start pin", null)];
+  legs.forEach((leg, index) => {
+    const startedAt = elapsed;
+    elapsed += leg.minutes;
+    if (leg.type === "ride") {
+      const stops = leg.stopTimes
+        .map((stop, offset) => {
+          const role = offset === 0 ? "dep." : "arr.";
+          return `<li><span>${escapeHtml(stop.name)}</span><span>${role} ${Math.round(stop.minutes)} min</span></li>`;
+        })
+        .join("");
+      const chip = `<span class="route-chip route-chip-line" style="background:${leg.color};color:${leg.textColor}">${escapeHtml(leg.label)}</span>`;
+      const stopCount = `${leg.stops} stop${leg.stops === 1 ? "" : "s"}`;
+      steps.push(step(startedAt, `${chip} ${escapeHtml(leg.from)} → ${escapeHtml(leg.to)}`, stopCount, leg.minutes, `<ol class="trip-stops">${stops}</ol>`));
+      return;
+    }
+    if (leg.type === "wait") {
+      steps.push(step(startedAt, `Wait for ${escapeHtml(leg.label)}`, `at ${placeName(legs[index + 1]) ?? "the platform"} · average for this line`, leg.minutes));
+      return;
+    }
+    if (leg.type === "change") {
+      steps.push(step(startedAt, `Change to ${escapeHtml(leg.label)}`, `at ${leg.at} · includes the average wait`, leg.minutes));
+      return;
+    }
+    const verb = leg.type === "bike" ? "Bike" : "Walk";
+    const previousRide = legs[index - 1]?.type === "ride" ? legs[index - 1] : null;
+    const upcoming = nextRide(index);
+    const from = previousRide ? `from ${previousRide.to}` : index === 0 ? "from the start" : "";
+    const to = upcoming && legs.indexOf(upcoming) <= index + 2 ? `to ${upcoming.from}` : index === legs.length - 1 ? "to the destination" : "";
+    const distance = leg.meters < 5 ? "platform access" : formatMeters(leg.meters);
+    steps.push(step(startedAt, `${verb} ${distance}`, [from, to].filter(Boolean).join(" "), leg.minutes));
+  });
+  steps.push(step(total, "Arrive", "at the measure pin", null));
+
+  return `<ul class="trip-summary">${summary}</ul><ol class="trip-timeline">${steps.join("")}</ol>`;
+}
+
+function syncTripDetailsToggle() {
+  const open = state.tripDetailsOpen && !tripDetailsButton.hidden;
+  tripDetailsButton.setAttribute("aria-expanded", String(open));
+  routeSteps.classList.toggle("is-expanded", open);
 }
 
 // ---------- heatmap, pins, export ----------
@@ -1895,11 +2000,9 @@ function hitPin(screenPoint) {
 
 function syncCursor() {
   const drag = state.drag?.target;
-  mapCanvas.classList.toggle("is-panning", drag === "pan");
-  mapCanvas.classList.toggle("is-pan-ready", !drag && state.spaceHeld);
+  mapCanvas.classList.toggle("is-panning", drag === "map" && state.drag.moved);
   mapCanvas.classList.toggle("is-dragging-pin", drag === "origin" || drag === "probe");
-  mapCanvas.classList.toggle("is-over-pin", !drag && !state.spaceHeld && Boolean(state.hoverPin));
-  hintBar.classList.toggle("is-panning", state.spaceHeld || drag === "pan");
+  mapCanvas.classList.toggle("is-over-pin", !drag && Boolean(state.hoverPin));
 }
 
 function setOrigin(worldPoint, label = null) {
@@ -1923,26 +2026,15 @@ function handlePointerDown(event) {
   mapCanvas.setPointerCapture(event.pointerId);
   const base = { pointerId: event.pointerId, startScreen: screenPoint, moved: false };
 
-  if (state.spaceHeld) {
-    state.drag = { ...base, target: "pan", startCenter: state.viewportCenter.slice() };
-  } else if (!withinBounds(worldPoint)) {
-    return;
-  } else if (hitPin(screenPoint) === "origin") {
-    // The start pin only moves when dragged.
-    state.drag = { ...base, target: "origin" };
-  } else if (!state.originPoint) {
-    state.originPoint = worldPoint;
-    state.originLabel = null;
-    state.drag = { ...base, target: "origin" };
-  } else if (hitPin(screenPoint) === "probe") {
-    state.drag = { ...base, target: "probe", created: false };
+  const pin = hitPin(screenPoint);
+  if (pin) {
+    // Pins move when dragged; clicking the measuring pin without moving it removes it.
+    state.drag = { ...base, target: pin };
   } else {
-    // Any other click drops the measuring pin there (or jumps it), and dragging explores.
-    state.probePoint = worldPoint;
-    state.drag = { ...base, target: "probe", created: true };
+    // Dragging empty map pans; a click without movement places a pin (see handlePointerUp).
+    state.drag = { ...base, target: "map", startCenter: state.viewportCenter.slice() };
   }
   syncCursor();
-  invalidate();
 }
 
 function handlePointerMove(event) {
@@ -1959,7 +2051,9 @@ function handlePointerMove(event) {
   if (Math.hypot(screenPoint[0] - drag.startScreen[0], screenPoint[1] - drag.startScreen[1]) > CLICK_SLOP_PX) {
     drag.moved = true;
   }
-  if (drag.target === "pan") {
+  if (drag.target === "map") {
+    if (!drag.moved) return;
+    syncCursor();
     const scale = state.transform.scale;
     setViewport(state.viewportScale, [
       drag.startCenter[0] - (screenPoint[0] - drag.startScreen[0]) / scale,
@@ -1980,9 +2074,19 @@ function handlePointerMove(event) {
 function handlePointerUp(event) {
   const drag = state.drag;
   if (!drag || drag.pointerId !== event.pointerId) return;
-  // Clicking the measuring pin without moving it removes it.
-  if (drag.target === "probe" && !drag.created && !drag.moved) {
-    state.probePoint = null;
+  if (!drag.moved && event.type === "pointerup") {
+    const worldPoint = state.transform.toWorld(drag.startScreen[0], drag.startScreen[1]);
+    if (drag.target === "probe") {
+      state.probePoint = null;
+    } else if (drag.target === "map" && withinBounds(worldPoint)) {
+      // The first click sets the start pin; later clicks drop (or jump) the measuring pin.
+      if (!state.originPoint) {
+        state.originPoint = worldPoint;
+        state.originLabel = null;
+      } else {
+        state.probePoint = worldPoint;
+      }
+    }
   }
   state.drag = null;
   try {
@@ -2034,7 +2138,7 @@ function buildViewUrlFragment() {
   }
   if (!state.showHeatmap) params.set("heatmap", "0");
   if (state.showReachOutline) params.set("outline", "1");
-  if (state.showRoute) params.set("route", "1");
+  if (!state.showRoute) params.set("route", "0");
   const defaultModes = defaultModeIds();
   const modesAreDefault =
     state.enabledModes?.size === defaultModes.length && defaultModes.every((mode) => state.enabledModes.has(mode));
@@ -2057,7 +2161,7 @@ function parseSharedView() {
     view: viewMatch ? { lat: Number(viewMatch[1]), lon: Number(viewMatch[2]), zoom: Number(viewMatch[3]) } : null,
     heatmap: searchParams.has("heatmap") ? searchParams.get("heatmap") !== "0" : null,
     outline: searchParams.has("outline") ? searchParams.get("outline") !== "0" : null,
-    route: searchParams.get("route") === "1",
+    route: searchParams.has("route") ? searchParams.get("route") !== "0" : null,
     modes: modesRaw === null ? null : modesRaw === "none" ? [] : modesRaw.split(","),
   };
 }
@@ -2191,7 +2295,7 @@ async function init() {
   const shared = parseSharedView();
   if (shared.heatmap !== null) state.showHeatmap = shared.heatmap;
   if (shared.outline !== null) state.showReachOutline = shared.outline;
-  state.showRoute = shared.route;
+  if (shared.route !== null) state.showRoute = shared.route;
   renderModeToggles();
   applyEnabledModes(shared.modes ?? loadStoredModes(), { persist: shared.modes === null });
 
@@ -2238,27 +2342,11 @@ async function init() {
 
   window.addEventListener("keydown", (event) => {
     if (isTypingTarget(event.target)) return;
-    if (event.code === "Space") {
-      event.preventDefault();
-      if (!state.spaceHeld) {
-        state.spaceHeld = true;
-        syncCursor();
-      }
-    } else if (event.key === "Escape" && state.probePoint) {
+    if (event.key === "Escape" && state.probePoint) {
       state.probePoint = null;
       syncBrowserUrl();
       invalidate();
     }
-  });
-  window.addEventListener("keyup", (event) => {
-    if (event.code === "Space") {
-      state.spaceHeld = false;
-      syncCursor();
-    }
-  });
-  window.addEventListener("blur", () => {
-    state.spaceHeld = false;
-    syncCursor();
   });
 
   for (const input of settingsInputs) {
@@ -2296,6 +2384,10 @@ async function init() {
     }
     syncBrowserUrl();
     invalidate();
+  });
+  tripDetailsButton.addEventListener("click", () => {
+    state.tripDetailsOpen = !state.tripDetailsOpen;
+    syncTripDetailsToggle();
   });
   outlineToggle.addEventListener("change", () => {
     state.showReachOutline = outlineToggle.checked;
@@ -2351,6 +2443,10 @@ async function init() {
   });
   locateButton.addEventListener("click", useCurrentLocation);
   clearButton.addEventListener("click", clearPins);
+  // The credits popover closes when you click anywhere else.
+  document.addEventListener("pointerdown", (event) => {
+    if (credits.open && !credits.contains(event.target)) credits.open = false;
+  });
 }
 
 init().catch((error) => {
