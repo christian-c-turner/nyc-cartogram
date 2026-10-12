@@ -21,6 +21,12 @@ class SiteHandler(SimpleHTTPRequestHandler):
             self.path = "/" + (f"?{query}" if query else "")
         super().do_GET()
 
+    def end_headers(self) -> None:
+        # Make browsers (Safari especially) revalidate on every load, so edits show up on reload;
+        # unchanged files still come back as a cheap 304.
+        self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
+
 
 def main() -> None:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000

@@ -42,8 +42,11 @@
         <div id="searchMeta" class="search-meta" hidden></div>
         <div id="searchResults" class="search-results" aria-live="polite"></div>
         <div class="brand-actions">
-          <button id="locateButton" class="button button-quiet" type="button">Use my location</button>
+          <button id="locateButton" class="button button-quiet" type="button">My location</button>
           <button id="clearButton" class="button button-quiet" type="button" hidden>Clear pins</button>
+          <button id="tripDetailsButton" class="button button-quiet trip-details-button" type="button" aria-expanded="false" aria-controls="routeSteps" hidden>
+            Trip details <span class="trip-chevron" aria-hidden="true">▾</span>
+          </button>
         </div>
         <div id="routeSteps" class="route-steps" aria-live="polite" hidden></div>
       </section>
@@ -57,7 +60,7 @@
           <label class="slider-field">
             <span class="slider-head">
               <span>Max travel time</span>
-              <strong data-setting-value="maxTransitTime">60 min</strong>
+              <strong data-setting-value="maxTransitTime">30 min</strong>
             </span>
             <input data-setting-key="maxTransitTime" data-setting-unit="minutes" type="range" min="10" max="120" step="5" />
           </label>
@@ -81,9 +84,9 @@
       </section>
 
       <div id="hintBar" class="hint-bar" role="note">
-        <span><span class="pin-dot pin-dot-start"></span><b>Drag</b> the start pin to move it</span>
+        <span><span class="pin-dot pin-dot-start"></span><b>Click</b> to set the start pin, <b>drag</b> it to move</span>
         <span><span class="pin-dot pin-dot-measure"></span><b>Click</b> anywhere to measure travel time there · <kbd>Esc</kbd> clears</span>
-        <span><kbd>Space</kbd> + <b>drag</b> to pan</span>
+        <span><b>Drag</b> the map to pan</span>
         <span><b>Scroll</b> to zoom</span>
       </div>
 
@@ -91,9 +94,9 @@
         <div id="heatmapLegend" class="legend">
           <span id="heatmapLegendMin">0m</span>
           <div class="legend-scale" aria-hidden="true">
-            <span class="legend-tick"><span id="heatmapLegendMid">24m</span></span>
+            <span class="legend-tick"><span id="heatmapLegendMid">12m</span></span>
           </div>
-          <span id="heatmapLegendMax">60m</span>
+          <span id="heatmapLegendMax">30m</span>
         </div>
         <div class="tool-buttons">
           <button id="zoomInButton" class="tool-button" type="button" aria-label="Zoom in" title="Zoom in">+</button>
@@ -116,13 +119,16 @@
       <div id="cursorReadout" class="cursor-readout" aria-hidden="true" hidden></div>
       <p id="toast" class="toast" role="status" hidden></p>
 
-      <footer class="credits">
-        Times: Rejseplanen GTFS (typical weekday) + OpenStreetMap walk/bike network. Map data ©
-        <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a>.
-        Adapted from
-        <a href="https://github.com/AntCas/nyc-cartogram/tree/main" target="_blank" rel="noreferrer">NYC Commute POV</a>
-        by Anthony Castrio.
-      </footer>
+      <details id="credits" class="credits">
+        <summary aria-label="Data sources and credits" title="Data sources and credits">i</summary>
+        <p>
+          Times: Rejseplanen GTFS (typical weekday) + OpenStreetMap walk/bike network. Map data ©
+          <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a>.
+          Adapted from
+          <a href="https://github.com/AntCas/nyc-cartogram/tree/main" target="_blank" rel="noreferrer">NYC Commute POV</a>
+          by Anthony Castrio.
+        </p>
+      </details>
     </main>
 
     <script type="module">
