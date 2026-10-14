@@ -368,6 +368,7 @@ def build_transit(
     route_states = []
     station_states: List[List[int]] = []
     state_index: Dict[Tuple[int, str], int] = {}
+    service_numbers = {service_id: number for number, service_id in enumerate(sorted(network["services"]))}
     for station_index, station in enumerate(network["stations"]):
         point = lonlat_to_xy(station["lonlat"][0], station["lonlat"][1], lat0)
         stop_links = {}
@@ -380,18 +381,21 @@ def build_transit(
                     node, meters = -1, 0.0
             stop_links[stop_id] = (node, meters)
         states = []
-        for route_id in sorted(station["routes"]):
-            node, meters = stop_links[station["routeStops"][route_id]]
-            state_index[(station_index, route_id)] = len(route_states)
+        # One state per (station, service): a direction and stopping pattern of a line.
+        for service_id, service in sorted(station["services"].items()):
+            node, meters = stop_links[service["stop"]]
+            state_index[(station_index, service_id)] = len(route_states)
             states.append(len(route_states))
             route_states.append(
                 {
                     "stationIndex": station_index,
-                    "routeId": route_id,
-                    "mode": network["routes"][route_id]["mode"],
+                    "routeId": service["route"],
+                    "service": service_numbers[service_id],
+                    "mode": network["routes"][service["route"]]["mode"],
                     "node": node,
                     "linkMeters": round(meters, 1),
-                    "dwell": station["dwell"].get(route_id, 0.0),
+                    "dwell": service["dwell"],
+                    "wait": service["wait"],
                 }
             )
         station_states.append(states)
@@ -405,27 +409,29 @@ def build_transit(
             }
         )
 
-    waits = network["routeWaits"]
-    adjacency: List[Dict[int, float]] = [dict() for _ in route_states]
-    for from_station, to_station, route_id, minutes in network["edges"]:
-        a = state_index.get((from_station, route_id))
-        b = state_index.get((to_station, route_id))
-        if a is not None and b is not None and minutes < adjacency[a].get(b, math.inf):
-            adjacency[a][b] = minutes
-    # In-station transfers: GTFS minimum transfer time plus the expected wait for the next line's
-    # departure. Rides are timed from arrival, so the next line's dwell there is taken back off.
+    # Adjacency entries are [target, minutes] or, for a ride that adds wait for staying on past a
+    # station where fewer trains continue, [target, minutes, extra wait included in the minutes].
+    adjacency: List[Dict[int, list]] = [dict() for _ in route_states]
+    for from_station, to_station, service_id, minutes, extra_wait in network["edges"]:
+        a = state_index.get((from_station, service_id))
+        b = state_index.get((to_station, service_id))
+        weight = round(minutes + extra_wait, 2)
+        if a is not None and b is not None and weight < adjacency[a].get(b, [math.inf])[0]:
+            adjacency[a][b] = [weight, extra_wait] if extra_wait > 0 else [weight]
+    # In-station transfers: GTFS minimum transfer time plus the expected wait for the next service's
+    # departure. Rides are timed from arrival, so the next service's dwell there is taken back off.
     for station_index, station in enumerate(network["stations"]):
-        for from_route, to_route, seconds in station["transfers"]:
-            a = state_index[(station_index, from_route)]
-            b = state_index[(station_index, to_route)]
-            wait = max(0.0, waits.get(to_route, 4.0) - station["dwell"].get(to_route, 0.0))
-            adjacency[a][b] = round(seconds / 60.0 + wait, 2)
+        for from_service, to_service, seconds in station["transfers"]:
+            a = state_index[(station_index, from_service)]
+            b = state_index[(station_index, to_service)]
+            wait = max(0.0, route_states[b]["wait"] - route_states[b]["dwell"])
+            adjacency[a][b] = [round(seconds / 60.0 + wait, 2)]
 
     return (
         stations,
         route_states,
         station_states,
-        [[[target, round(weight, 2)] for target, weight in sorted(edges.items())] for edges in adjacency],
+        [[[target, *entry] for target, entry in sorted(edges.items())] for edges in adjacency],
     )
 
 
@@ -555,7 +561,6 @@ def main() -> None:
         "stations": stations,
         "routeStates": route_states,
         "stationStates": station_states,
-        "routeWaits": network["routeWaits"],
         "adjacency": transit_adjacency,
         "modes": [BIKE_MODE] + network["modes"],
         "routeStyles": network["routes"],

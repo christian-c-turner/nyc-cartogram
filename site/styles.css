@@ -370,8 +370,9 @@ body {
   transform: rotate(180deg);
 }
 
-.trip-details,
-.trip-details-only {
+.route-steps .trip-details,
+.route-steps .trip-details-only,
+.route-steps .trip-summary {
   display: none;
 }
 
@@ -383,14 +384,23 @@ body {
   display: grid;
   gap: 8px;
   margin-top: 6px;
-  /* Stop above the credits in the bottom-left corner. */
-  max-height: max(180px, calc(100vh - 430px));
+  /* Leave room for the summary below and stop above the credits in the bottom-left corner. */
+  max-height: max(140px, calc(100vh - 530px));
   overflow-y: auto;
   font-size: 0.78rem;
 }
 
 .route-steps.is-expanded .trip-details-only {
   display: inline;
+}
+
+/* Minutes per activity, pinned under the scrolling timeline. */
+.route-steps.is-expanded .trip-summary {
+  display: grid;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 0.78rem;
 }
 
 .trip-bar {
@@ -425,7 +435,6 @@ body {
 }
 
 .trip-summary {
-  display: grid;
   gap: 3px;
 }
 

@@ -812,7 +812,7 @@ function computeTravelField(originPoint) {
   if (state.fieldCache?.key === key) return state.fieldCache;
 
   const g = state.graph;
-  const { meta, routeStates, adjacency, routeWaits } = state.data;
+  const { meta, routeStates, adjacency } = state.data;
   const settings = currentTravelSettings();
   const bike = bikeEnabled();
   const walkSpeed = settings.walkingSpeed;
@@ -830,12 +830,18 @@ function computeTravelField(originPoint) {
       (meta.stationAccessMinutes[routeState.mode] ?? 1.5) + (bike ? meta.bikeStationExtraMinutes[routeState.mode] ?? 1 : 0);
     alightCost[index] = routeState.linkMeters / streetSpeed + platform;
     // Movia doesn't take bikes on buses, so with the bike on they can't be boarded. Rides are timed
-    // from arrival at each station, so the line's dwell there comes off the wait for its departure.
+    // from arrival at each station, so the service's dwell there comes off the wait for its departure.
     boardCost[index] =
       bike && routeState.mode === "bus"
         ? Infinity
-        : alightCost[index] + Math.max(0, (routeWaits[routeState.routeId] ?? 4) - (routeState.dwell ?? 0));
+        : alightCost[index] + Math.max(0, routeState.wait - (routeState.dwell ?? 0));
   });
+
+  // For each street node, the station where the fastest path to it last left a train (-1 if none).
+  // Changing trains inside a station goes through its transfer edges, which carry the feed's minimum
+  // change times; walking out to the street and straight back in would otherwise undercut them.
+  const alightedAt = new Int32Array(nodeCount).fill(-1);
+  let currentAlightedAt = -1;
 
   const heap = new MinHeap();
   let current = -1;
@@ -843,6 +849,7 @@ function computeTravelField(originPoint) {
     if (time < times[index]) {
       times[index] = time;
       previous[index] = current;
+      if (index < nodeCount) alightedAt[index] = currentAlightedAt;
       heap.push(index, time);
     }
   };
@@ -858,6 +865,7 @@ function computeTravelField(originPoint) {
     if (time > times[current]) continue;
     if (time > cutoff) break;
     if (current < nodeCount) {
+      currentAlightedAt = alightedAt[current];
       for (let edge = g.edgeOffsets[current]; edge < g.edgeOffsets[current + 1]; edge += 1) {
         const flags = g.edgeFlags[edge];
         let speed;
@@ -868,10 +876,13 @@ function computeTravelField(originPoint) {
       }
       for (let k = g.boardStart[current]; k < g.boardStart[current + 1]; k += 1) {
         const routeStateIndex = g.boardStates[k];
-        if (state.routeStateEnabled[routeStateIndex]) relax(nodeCount + routeStateIndex, time + boardCost[routeStateIndex]);
+        if (!state.routeStateEnabled[routeStateIndex]) continue;
+        if (routeStates[routeStateIndex].stationIndex === currentAlightedAt) continue;
+        relax(nodeCount + routeStateIndex, time + boardCost[routeStateIndex]);
       }
     } else {
       const routeStateIndex = current - nodeCount;
+      currentAlightedAt = routeStates[routeStateIndex].stationIndex;
       for (const [target, weight] of adjacency[routeStateIndex]) {
         if (state.routeStateEnabled[target]) relax(nodeCount + target, time + weight);
       }
@@ -1001,7 +1012,7 @@ function traceRoute(field, probePoint) {
 
 function buildRouteLegs(field, chain, end) {
   const nodeCount = state.graph.nodeCount;
-  const { routeStates, stations, routeStyles, meta, routeWaits } = state.data;
+  const { routeStates, stations, routeStyles, meta, adjacency } = state.data;
   const times = field.times;
   const settings = currentTravelSettings();
   const streetSpeed = field.bike ? settings.cyclingSpeed : settings.walkingSpeed;
@@ -1060,9 +1071,11 @@ function buildRouteLegs(field, chain, end) {
       continue;
     }
 
-    // Transit run: consecutive (station, line) states until the traveller is back on the street.
-    // Rides are timed arrival-to-arrival, so a line's departure from a station is its arrival
+    // Transit run: consecutive (station, service) states until the traveller is back on the street.
+    // Rides are timed arrival-to-arrival, so a service's departure from a station is its arrival
     // there plus its dwell; that split gives wait, ride, and change rows that add up to the total.
+    // Ride edges can also carry extra wait (for staying on past a station where fewer trains
+    // continue); that is really time spent waiting for the right train, so it moves to the wait row.
     let runEnd = index;
     while (runEnd + 1 < chain.length && chain[runEnd + 1] >= nodeCount) runEnd += 1;
     const firstState = routeStates[chain[index] - nodeCount];
@@ -1074,13 +1087,21 @@ function buildRouteLegs(field, chain, end) {
     let readyTime = platformTime; // when the traveller is on the platform for the next line
     for (let k = index; k <= runEnd; k += 1) {
       const lastOfGroup =
-        k === runEnd || routeStates[chain[k + 1] - nodeCount].routeId !== routeStates[chain[k] - nodeCount].routeId;
+        k === runEnd || routeStates[chain[k + 1] - nodeCount].service !== routeStates[chain[k] - nodeCount].service;
       if (!lastOfGroup) continue;
       const group = chain.slice(groupStart, k + 1).map((value) => routeStates[value - nodeCount]);
       const routeId = group[0].routeId;
       const style = routeStyles[routeId] ?? {};
       const label = style.label ?? routeId;
-      const departure = times[chain[groupStart]] + (group[0].dwell ?? 0);
+      // Extra wait still to come after each stop of the ride.
+      const extraAfter = new Array(group.length).fill(0);
+      for (let hop = group.length - 2; hop >= 0; hop -= 1) {
+        const from = chain[groupStart + hop] - nodeCount;
+        const to = chain[groupStart + hop + 1] - nodeCount;
+        const entry = adjacency[from].find(([target]) => target === to);
+        extraAfter[hop] = extraAfter[hop + 1] + (entry?.[2] ?? 0);
+      }
+      const departure = times[chain[groupStart]] + (group[0].dwell ?? 0) + extraAfter[0];
       const arrival = times[chain[k]];
       const stationIndexes = group.map((routeState) => routeState.stationIndex);
 
@@ -1114,7 +1135,7 @@ function buildRouteLegs(field, chain, end) {
         // Minutes since leaving the start pin: departure from the first station, arrival at the rest.
         stopTimes: stationIndexes.map((stationIndex, offset) => ({
           name: stations[stationIndex].name,
-          minutes: offset === 0 ? departure : times[chain[groupStart + offset]],
+          minutes: offset === 0 ? departure : times[chain[groupStart + offset]] + extraAfter[offset],
         })),
         stationPoints: [stations[stationIndexes[0]].point, stations[stationIndexes[stationIndexes.length - 1]].point],
         points,
@@ -1266,7 +1287,8 @@ function renderRouteSteps(route) {
   // The brief list and the full breakdown are both rendered; "Trip details" switches between them.
   routeSteps.innerHTML = `${routeTimeBar(route)}<p class="route-total">Fastest route · <strong>${formatMinutes(route.total)}</strong></p>
     <ol class="route-brief">${rows}</ol>
-    <div class="trip-details">${tripDetailsHtml(route)}</div>
+    <div class="trip-details"><ol class="trip-timeline">${tripTimelineHtml(route)}</ol></div>
+    <ul class="trip-summary">${tripSummaryHtml(route)}</ul>
     <p class="route-note"><span class="trip-details-only">Left column: minutes since leaving the start pin. </span>Walks include getting to and from platforms. Waits and changes are averages based on how often each line runs.</p>`;
   routeSteps.hidden = false;
   syncTripDetailsToggle();
@@ -1296,14 +1318,13 @@ const TRIP_CATEGORIES = [
   { type: "change", label: "Changing" },
 ];
 
-// The full itinerary behind the "Trip details" button: minutes per activity, and every step
-// (including each stop along a ride) with the minutes elapsed since leaving the start pin.
-function tripDetailsHtml(route) {
+// Minutes per activity, shown under the "Trip details" timeline.
+function tripSummaryHtml(route) {
   const legs = route.legs;
   const total = route.total;
   // A single line colours its own swatch; several lines share the accent colour.
   const rideColors = new Set(legs.filter((leg) => leg.type === "ride").map((leg) => leg.color));
-  const summary = TRIP_CATEGORIES.map(({ type, label }) => {
+  return TRIP_CATEGORIES.map(({ type, label }) => {
     const minutes = legs.filter((leg) => leg.type === type).reduce((sum, leg) => sum + leg.minutes, 0);
     if (minutes <= 0) return "";
     const share = total > 0 ? Math.round((minutes / total) * 100) : 0;
@@ -1311,7 +1332,13 @@ function tripDetailsHtml(route) {
     return `<li><span class="trip-swatch trip-swatch-${type}"${swatchStyle}></span><span>${label}</span>
       <span class="trip-share">${share}%</span><strong>${formatMinutes(minutes)}</strong></li>`;
   }).join("");
+}
 
+// The full itinerary behind the "Trip details" button: every step (including each stop along a
+// ride) with the minutes elapsed since leaving the start pin.
+function tripTimelineHtml(route) {
+  const legs = route.legs;
+  const total = route.total;
   const placeName = (leg) => (leg?.type === "ride" ? leg.from : null);
   const nextRide = (index) => legs.slice(index + 1).find((leg) => leg.type === "ride");
   const step = (elapsed, title, detail, minutes, extra = "") => `<li>
@@ -1354,7 +1381,7 @@ function tripDetailsHtml(route) {
   });
   steps.push(step(total, "Arrive", "at the measure pin", null));
 
-  return `<ul class="trip-summary">${summary}</ul><ol class="trip-timeline">${steps.join("")}</ol>`;
+  return steps.join("");
 }
 
 function syncTripDetailsToggle() {
@@ -2005,8 +2032,38 @@ function syncCursor() {
   mapCanvas.classList.toggle("is-over-pin", !drag && Boolean(state.hoverPin));
 }
 
+// A pin that comes to rest on water (or off the modelled land) moves to the centre of the nearest
+// land cell; the land grid is rasterized at cell centres, so that centre is always on land.
+function snapToLand(point) {
+  const { gridCols, gridRows, bounds } = state.data.meta;
+  const [minX, minY, maxX, maxY] = bounds;
+  const cellW = (maxX - minX) / gridCols;
+  const cellH = (maxY - minY) / gridRows;
+  const cellNode = state.graph.cellNode;
+  const col = clamp(Math.floor((point[0] - minX) / cellW), 0, gridCols - 1);
+  const row = clamp(Math.floor((point[1] - minY) / cellH), 0, gridRows - 1);
+  if (cellNode[row * gridCols + col] >= 0) return point;
+  let best = null;
+  for (let ring = 1; ring < Math.max(gridCols, gridRows); ring += 1) {
+    // Cells in this ring are at least (ring - 0.5) cells away; stop once none can beat the best.
+    if (best && (ring - 0.5) * Math.min(cellW, cellH) > best.meters) break;
+    for (let r = row - ring; r <= row + ring; r += 1) {
+      if (r < 0 || r >= gridRows) continue;
+      for (let c = col - ring; c <= col + ring; c += 1) {
+        if (c < 0 || c >= gridCols) continue;
+        if (Math.max(Math.abs(r - row), Math.abs(c - col)) !== ring) continue;
+        if (cellNode[r * gridCols + c] < 0) continue;
+        const center = [minX + (c + 0.5) * cellW, minY + (r + 0.5) * cellH];
+        const meters = distance(point, center);
+        if (!best || meters < best.meters) best = { point: center, meters };
+      }
+    }
+  }
+  return best ? best.point : point;
+}
+
 function setOrigin(worldPoint, label = null) {
-  state.originPoint = worldPoint;
+  state.originPoint = snapToLand(worldPoint);
   state.originLabel = label;
   syncBrowserUrl();
   invalidate();
@@ -2088,6 +2145,9 @@ function handlePointerUp(event) {
       }
     }
   }
+  // Pins move freely while dragged and settle onto land when dropped.
+  if (state.originPoint) state.originPoint = snapToLand(state.originPoint);
+  if (state.probePoint) state.probePoint = snapToLand(state.probePoint);
   state.drag = null;
   try {
     mapCanvas.releasePointerCapture(event.pointerId);
@@ -2307,11 +2367,11 @@ async function init() {
   }
   if (shared.origin) {
     const point = lonLatToWorld(shared.origin.lon, shared.origin.lat);
-    if (withinBounds(point)) state.originPoint = point;
+    if (withinBounds(point)) state.originPoint = snapToLand(point);
   }
   if (shared.probe && state.originPoint) {
     const point = lonLatToWorld(shared.probe.lon, shared.probe.lat);
-    if (withinBounds(point)) state.probePoint = point;
+    if (withinBounds(point)) state.probePoint = snapToLand(point);
   }
 
   heatmapToggle.checked = state.showHeatmap;

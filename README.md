@@ -111,9 +111,12 @@ node:
    you may cycle it in each direction (one-way streets apply to bikes unless `oneway:bicycle=no`).
    Footways, pedestrian streets, and steps are walk-only; `bicycle=use_sidepath` roads defer to the
    separately mapped cycle tracks.
-2. **Transit states**: one per (station, line), connected by median scheduled arrival-to-arrival times
+2. **Transit states**: one per (station, service), connected by median scheduled arrival-to-arrival times
    between consecutive stations on a representative weekday, so time standing at stations a train passes
-   through is included. Each state also records the line's median dwell there, so a ride you board is
+   through is included. A service is one direction and stopping pattern of a line (short workings fold
+   into the longer pattern they are part of), so you can only stay on board where a real train
+   continues: DSB's airport trains via Glostrup and København Syd are a different service from its
+   trains via Valby. Each state also records the service's median dwell there, so a ride you board is
    timed from its departure; rides match the timetable's departure-to-arrival times.
 
 Moves between them:
@@ -122,11 +125,14 @@ Moves between them:
   assumptions, as used by Google Maps). On walk-only edges you push the bike at walking speed.
 - **Boarding** from a station's street node costs the walk/ride to the platform, a per-mode platform access
   time (Metro/regional 2 min, S-tog 1.5, Letbane/harbour bus 0.5, bus 0.3; +0.5–1 min with a bike), and the
-  line's expected wait for a departure (half its 07:00–19:00 headway, 1.5–15 min). **Alighting** costs the
-  same minus the wait.
+  expected wait for a departure: half the 07:00–19:00 headway of the line's trains to the next station,
+  1.5–30 min. Staying on past a station where fewer of those trains continue adds the difference there
+  (e.g. ~26 min at Glostrup for the hourly airport train). **Alighting** costs the same minus the wait.
 - **Transfers** inside a station use the minimum platform-to-platform times from GTFS `transfers.txt`
   (line-specific where given, e.g. 60 s cross-platform S-tog changes at København H), plus the wait
-  for the next line. Transfers between nearby stations simply happen on the street network.
+  for the next service. You can't get round these by stepping out to the street and straight back in:
+  after leaving a train, the search won't board anything at that same station again. Transfers between
+  nearby stations (e.g. to a bus stop outside) simply happen on the street network.
 - The **itinerary** splits a route into walk/bike legs (including getting to and from platforms), waits,
   changes, and rides; ride rows are in-vehicle time only.
 - **Grid cells** (50 m) take the time of their nearest street node plus the walk from it. Only nodes in

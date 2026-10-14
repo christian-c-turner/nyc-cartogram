@@ -25,7 +25,7 @@ GTFS_DIR = ROOT / "GTFS"
 DATA_DIR = ROOT / "data"
 MUNICIPALITIES_PATH = DATA_DIR / "cph_municipalities.geojson"
 CACHE_PATH = DATA_DIR / "cph_transit_network.json"
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 
 MODES = [
     {"id": "metro", "label": "Metro", "color": "#E30613"},
@@ -82,13 +82,14 @@ STATION_BOUNDARY_BUFFER = 400.0
 
 SERVICE_WINDOW = (7 * 3600, 19 * 3600)
 MIN_EDGE_SECONDS = 20
-# Longer stops than this are layovers (e.g. a regional train waiting at København H), not dwell.
-MAX_DWELL_SECONDS = 10 * 60
+# Stops up to this long count as dwell, including layovers such as a regional train standing
+# 12 minutes at København H before continuing to the airport.
+MAX_DWELL_SECONDS = 30 * 60
 MAX_EDGE_SECONDS = 45 * 60
 MAX_SHAPES_PER_ROUTE_DIRECTION = 2
 SHAPE_CLIP_MARGIN_DEG = (0.03, 0.05)  # lat, lon
 MIN_WAIT = 1.5
-MAX_WAIT = 15.0
+MAX_WAIT = 30.0
 # Used when transfers.txt has no entry for a pair of platforms in the same station.
 DEFAULT_SAME_STOP_TRANSFER_SECONDS = 120
 DEFAULT_CROSS_STOP_TRANSFER_SECONDS = 240
@@ -196,6 +197,12 @@ def normalize_station_name(name: str) -> str:
     name = re.sub(r"\s+St\.$", "", name.strip())
     name = re.sub(r"\s+", " ", name).strip()
     return STATION_NAME_ALIASES.get(name, name)
+
+
+def contains_run(longer: Sequence[int], shorter: Sequence[int]) -> bool:
+    """Whether `shorter` appears as a contiguous run inside `longer`."""
+    size = len(shorter)
+    return any(tuple(longer[start : start + size]) == tuple(shorter) for start in range(len(longer) - size + 1))
 
 
 def active_services_by_date() -> Dict[str, set]:
@@ -312,71 +319,136 @@ def build_network() -> dict:
         )
         if match is None:
             match = len(complexes)
-            complexes.append(
-                {"name": stop["name"], "points": [], "stops": {}, "routes": set(), "modes": set(), "routeStops": defaultdict(Counter)}
-            )
+            complexes.append({"name": stop["name"], "points": [], "stops": {}})
             by_name[group].append(match)
         complexes[match]["points"].append(stop["point"])
         complexes[match]["stops"][stop_id] = stop["point"]
         stop_to_station[stop_id] = match
 
+    # Each trip as its run of station complexes in the area: (station, stop_id, arrival, departure).
+    runs: Dict[str, List[Tuple[int, str, int, int]]] = {}
+    for trip_id, rows in stop_times.items():
+        rows.sort()
+        run: List[Tuple[int, str, int, int]] = []
+        for _, stop_id, arrival, departure in rows:
+            if stop_id not in stop_to_station:
+                continue
+            station = stop_to_station[stop_id]
+            if run and run[-1][0] == station:
+                run[-1] = (station, run[-1][1], run[-1][2], departure)
+            else:
+                run.append((station, stop_id, arrival, departure))
+        if len(run) >= 2:
+            runs[trip_id] = run
+
+    def in_window(seconds: int) -> bool:
+        return SERVICE_WINDOW[0] <= seconds < SERVICE_WINDOW[1]
+
+    # Daytime departures per line between consecutive stations, and of those, per pair of hops a
+    # train makes in a row. Lines are counted as a whole (all DSB trains, say), so a stretch several
+    # services share gets their combined frequency.
+    hop_departures: Counter = Counter()
+    through_departures: Counter = Counter()
+    for trip_id, run in runs.items():
+        route_key = trips[trip_id]["route"]
+        for k in range(len(run) - 1):
+            if not in_window(run[k][3]):
+                continue
+            hop_departures[(route_key, run[k][0], run[k + 1][0])] += 1
+            if k:
+                through_departures[(route_key, run[k - 1][0], run[k][0], run[k + 1][0])] += 1
+    # Routes with no regular daytime service (night buses, a few peak-only extras) would otherwise
+    # look available all day; leave them out.
+    active_routes = {route_key for (route_key, _a, _b), count in hop_departures.items() if count >= 2}
+
+    # Split each line into services: trips with the same stopping pattern, with short workings
+    # (a contiguous part of a longer pattern) folded into the longer one. You can only stay on board
+    # along a service, so two trains of the same line are never chained into a ride no train makes
+    # (e.g. DSB west from Valby to Glostrup, then back east on the airport train).
+    pattern_trips: Dict[Tuple[str, Tuple[int, ...]], List[str]] = defaultdict(list)
+    for trip_id, run in runs.items():
+        route_key = trips[trip_id]["route"]
+        if route_key in active_routes and any(in_window(row[3]) for row in run[:-1]):
+            pattern_trips[(route_key, tuple(row[0] for row in run))].append(trip_id)
+    service_stations: List[Tuple[int, ...]] = []
+    service_routes: List[str] = []
+    service_trips: List[List[str]] = []
+    services_by_route: Dict[str, List[int]] = defaultdict(list)
+    for (route_key, pattern), trip_ids in sorted(
+        pattern_trips.items(), key=lambda item: (-len(item[0][1]), -len(item[1]), item[0])
+    ):
+        containing = [
+            service for service in services_by_route[route_key] if contains_run(service_stations[service], pattern)
+        ]
+        if containing:
+            service = max(containing, key=lambda index: len(service_trips[index]))
+        else:
+            service = len(service_stations)
+            service_stations.append(pattern)
+            service_routes.append(route_key)
+            service_trips.append([])
+            services_by_route[route_key].append(service)
+        service_trips[service].extend(trip_ids)
+    service_ids = [f"{route_key}#{services_by_route[route_key].index(index) + 1}" for index, route_key in enumerate(service_routes)]
+
     # Ride times are arrival-to-arrival, so time standing at stations a train passes through is
-    # included; the dwell at each (station, line) is kept so a ride is timed from its departure
+    # included; the dwell at each (station, service) is kept so a ride is timed from its departure
     # where you board (see "dwell" in the output and how the app subtracts it when boarding).
-    durations: Dict[Tuple[int, int, str], List[float]] = defaultdict(list)
-    dwells: Dict[Tuple[int, str], List[float]] = defaultdict(list)
-    departures: Dict[Tuple[str, int, int], int] = Counter()
+    durations: Dict[Tuple[int, int, int], List[float]] = defaultdict(list)
+    dwells: Dict[Tuple[int, int], List[float]] = defaultdict(list)
+    service_stops: Dict[Tuple[int, int], Counter] = defaultdict(Counter)
     route_modes: Dict[str, str] = {}
     shape_counts: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
-    for trip_id, rows in stop_times.items():
-        trip = trips[trip_id]
-        route_key = trip["route"]
-        rows.sort()
-        in_area = [row for row in rows if row[1] in stop_to_station]
-        if len(in_area) < 2:
-            continue
-        route_modes[route_key] = trip["mode"]
-        if trip["shape_id"]:
-            shape_counts[(route_key, trip["direction"])][trip["shape_id"]] += 1
-        for _, stop_id, arrival, departure in in_area:
-            station = stop_to_station[stop_id]
-            complexes[station]["routes"].add(route_key)
-            complexes[station]["modes"].add(trip["mode"])
-            complexes[station]["routeStops"][route_key][stop_id] += 1
-            if 0 <= departure - arrival <= MAX_DWELL_SECONDS:
-                dwells[(station, route_key)].append((departure - arrival) / 60.0)
-        for prev, nxt in zip(in_area, in_area[1:]):
-            from_station = stop_to_station[prev[1]]
-            to_station = stop_to_station[nxt[1]]
-            if from_station == to_station:
-                continue
-            if SERVICE_WINDOW[0] <= prev[3] < SERVICE_WINDOW[1]:
-                departures[(route_key, from_station, to_station)] += 1
-            seconds = nxt[2] - prev[2]
-            if MIN_EDGE_SECONDS <= seconds <= MAX_EDGE_SECONDS:
-                durations[(from_station, to_station, route_key)].append(seconds / 60.0)
+    for service, trip_ids in enumerate(service_trips):
+        for trip_id in trip_ids:
+            trip = trips[trip_id]
+            run = runs[trip_id]
+            route_modes[trip["route"]] = trip["mode"]
+            if trip["shape_id"]:
+                shape_counts[(trip["route"], trip["direction"])][trip["shape_id"]] += 1
+            for station, stop_id, arrival, departure in run:
+                service_stops[(station, service)][stop_id] += 1
+                if 0 <= departure - arrival <= MAX_DWELL_SECONDS:
+                    dwells[(station, service)].append((departure - arrival) / 60.0)
+            for prev, nxt in zip(run, run[1:]):
+                seconds = nxt[2] - prev[2]
+                if MIN_EDGE_SECONDS <= seconds <= MAX_EDGE_SECONDS:
+                    durations[(prev[0], nxt[0], service)].append(seconds / 60.0)
+    dwell = {key: round(statistics.median(values), 2) for key, values in dwells.items()}
 
-    # Typical wait = half the daytime headway between consecutive stations (so merged routes
-    # and branches count per direction), taken as the median over all station pairs served.
+    # Expected waits are half the daytime headway, 1.5–30 min. Boarding a service costs the wait for
+    # its next hop, counting every train of the line that makes that hop. Staying on past a station
+    # where fewer of the line's trains continue (Glostrup, for the hourly airport train) adds the
+    # difference there: the wait for a train that does both hops, less the wait already counted for
+    # the hop before.
     window_minutes = (SERVICE_WINDOW[1] - SERVICE_WINDOW[0]) / 60.0
-    headways: Dict[str, List[float]] = defaultdict(list)
-    for (route_key, _from_station, _to_station), count in departures.items():
-        if count >= 2:
-            headways[route_key].append(window_minutes / count)
-    route_waits = {
-        route_key: round(clamp(statistics.median(values) / 2.0, MIN_WAIT, MAX_WAIT), 2)
-        for route_key, values in headways.items()
-    }
 
-    # Routes with no regular daytime service (night buses, a few peak-only extras) would otherwise
-    # look available all day with a guessed wait; leave them out.
-    for station in complexes:
-        station["routes"] &= route_waits.keys()
-        station["modes"] = {route_modes[route] for route in station["routes"]}
-        station["routeStops"] = {route: stops_ for route, stops_ in station["routeStops"].items() if route in route_waits}
-    durations = {key: values for key, values in durations.items() if key[2] in route_waits}
-    route_modes = {route: mode for route, mode in route_modes.items() if route in route_waits}
-    shape_counts = {key: counter for key, counter in shape_counts.items() if key[0] in route_waits}
+    def expected_wait(departures: int) -> float:
+        if departures <= 0:
+            return MAX_WAIT
+        return clamp(window_minutes / departures / 2.0, MIN_WAIT, MAX_WAIT)
+
+    state_waits: Dict[Tuple[int, int], float] = {}
+    edge_extra_waits: Dict[Tuple[int, int, int], float] = {}
+    for service, stations_ in enumerate(service_stations):
+        route_key = service_routes[service]
+        for k in range(len(stations_) - 1):
+            here, after = stations_[k], stations_[k + 1]
+            wait = expected_wait(hop_departures[(route_key, here, after)])
+            extra = 0.0
+            if k:
+                before = stations_[k - 1]
+                extra = max(
+                    0.0,
+                    expected_wait(through_departures[(route_key, before, here, after)])
+                    - expected_wait(hop_departures[(route_key, before, here)]),
+                )
+                # Someone boarding here pays at least the dwell (the app takes it off the wait), so
+                # keep wait + extra at the full wait even when the train stands here a while.
+                extra = min(extra, max(0.0, wait - dwell.get((here, service), 0.0)))
+            edge_key = (here, after, service)
+            edge_extra_waits[edge_key] = max(edge_extra_waits.get(edge_key, 0.0), extra)
+            state_waits[(here, service)] = min(state_waits.get((here, service), math.inf), wait - extra)
 
     # Minimum platform-to-platform transfer times from transfers.txt (seconds). Line-specific
     # rows (e.g. cross-platform S-tog changes) take precedence over stop-level ones.
@@ -408,45 +480,77 @@ def build_network() -> dict:
             return stop_transfers[(from_stop, to_stop)]
         return DEFAULT_SAME_STOP_TRANSFER_SECONDS if from_stop == to_stop else DEFAULT_CROSS_STOP_TRANSFER_SECONDS
 
-    # Drop complexes no modelled route actually stops at, then re-index.
-    keep = [index for index, station in enumerate(complexes) if station["routes"]]
+    # Where each service comes from and goes next at each station, for pruning useless transfers.
+    previous_stations: Dict[Tuple[int, int], set] = defaultdict(set)
+    next_stations: Dict[Tuple[int, int], set] = defaultdict(set)
+    for service, stations_ in enumerate(service_stations):
+        for here, after in zip(stations_, stations_[1:]):
+            next_stations[(here, service)].add(after)
+            previous_stations[(after, service)].add(here)
+    station_services: Dict[int, List[int]] = defaultdict(list)
+    for station, service in sorted(service_stops):
+        station_services[station].append(service)
+
+    # Drop complexes no modelled service actually stops at, then re-index.
+    keep = sorted(station_services)
     remap = {old: new for new, old in enumerate(keep)}
     stations = []
     for old in keep:
         station = complexes[old]
         lon = sum(p[0] for p in station["points"]) / len(station["points"])
         lat = sum(p[1] for p in station["points"]) / len(station["points"])
-        route_stops = {route: counter.most_common(1)[0][0] for route, counter in station["routeStops"].items()}
+        services_here = station_services[old]
+        stops_used = {service: service_stops[(old, service)].most_common(1)[0][0] for service in services_here}
+        # Changing is only useful from a service that arrives here to one that leaves, and not onto
+        # the same line heading back where you came from.
         transfers = [
-            [a, b, transfer_seconds(route_stops[a], route_stops[b], a, b)]
-            for a in sorted(route_stops)
-            for b in sorted(route_stops)
+            [
+                service_ids[a],
+                service_ids[b],
+                transfer_seconds(stops_used[a], stops_used[b], service_routes[a], service_routes[b]),
+            ]
+            for a in services_here
+            for b in services_here
             if a != b
+            and previous_stations[(old, a)]
+            and next_stations[(old, b)]
+            and not (service_routes[a] == service_routes[b] and next_stations[(old, b)] & previous_stations[(old, a)])
         ]
+        routes_here = sorted({service_routes[service] for service in services_here})
         stations.append(
             {
                 "id": str(len(stations)),
                 "name": station["name"],
                 "lonlat": [round(lon, 6), round(lat, 6)],
-                "routes": sorted(station["routes"]),
-                "modes": sorted(station["modes"]),
+                "routes": routes_here,
+                "modes": sorted({route_modes[route] for route in routes_here}),
                 "stops": {
                     stop_id: [round(point[0], 6), round(point[1], 6)]
                     for stop_id, point in station["stops"].items()
-                    if stop_id in route_stops.values()
+                    if stop_id in stops_used.values()
                 },
-                "routeStops": route_stops,
+                "services": {
+                    service_ids[service]: {
+                        "route": service_routes[service],
+                        "stop": stops_used[service],
+                        "dwell": dwell.get((old, service), 0.0),
+                        # A service's last stop has nothing to board.
+                        "wait": round(state_waits.get((old, service), MAX_WAIT), 2),
+                    }
+                    for service in services_here
+                },
                 "transfers": transfers,
-                "dwell": {
-                    route: round(statistics.median(dwells[(old, route)]), 2) if dwells.get((old, route)) else 0.0
-                    for route in route_stops
-                },
             }
         )
     edges = [
-        [remap[a], remap[b], route_key, round(statistics.median(values), 2)]
-        for (a, b, route_key), values in sorted(durations.items())
-        if a in remap and b in remap
+        [
+            remap[a],
+            remap[b],
+            service_ids[service],
+            round(statistics.median(values), 2),
+            round(edge_extra_waits.get((a, b, service), 0.0), 2),
+        ]
+        for (a, b, service), values in sorted(durations.items())
     ]
 
     selected_shapes: Dict[str, str] = {}
@@ -498,7 +602,7 @@ def build_network() -> dict:
         "serviceDate": service_date,
         "modes": MODES,
         "routes": routes,
-        "routeWaits": route_waits,
+        "services": {service_id: service_routes[index] for index, service_id in enumerate(service_ids)},
         "stations": stations,
         "edges": edges,
         "shapes": shapes,
@@ -520,5 +624,6 @@ def load_network(force: bool = False) -> dict:
 if __name__ == "__main__":
     net = load_network(force=True)
     print(f"{len(net['stations'])} stations, {len(net['edges'])} edges, {len(net['shapes'])} shape runs")
+    services_per_route = Counter(net["services"].values())
     for route_key, info in net["routes"].items():
-        print(f"  {info['mode']:9s} {route_key:12s} wait {net['routeWaits'].get(route_key)}")
+        print(f"  {info['mode']:9s} {route_key:12s} {services_per_route[route_key]} services")
