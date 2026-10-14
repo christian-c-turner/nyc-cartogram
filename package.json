@@ -1,7 +1,8 @@
 {
-  "name": "nyc-cartogram",
+  "name": "cph-cartogram",
   "private": true,
   "scripts": {
+    "serve": "python3 serve.py",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "login": "wrangler login"
