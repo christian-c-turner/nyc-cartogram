@@ -10,6 +10,7 @@ The result is cached in data/<prefix>_transit_network.json and rebuilt when the 
 
 from __future__ import annotations
 
+import bisect
 import csv
 import datetime as dt
 import json
@@ -22,8 +23,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from cities import COPENHAGEN, City, city_from_argv
+from platforms import PlatformDepth, platform_signature
 
-CACHE_VERSION = 9
+CACHE_VERSION = 12
 
 # Kept for the Copenhagen-only SVG generator.
 MODE_DRAW_ORDER = COPENHAGEN.mode_draw_order
@@ -46,7 +48,17 @@ MIN_WAIT = 1.5
 MAX_WAIT = 30.0
 # Used when transfers.txt has no entry for a pair of platforms in the same station.
 DEFAULT_SAME_STOP_TRANSFER_SECONDS = 120
-DEFAULT_CROSS_STOP_TRANSFER_SECONDS = 240
+# Between different stops: a minute plus the walk (1.5x the straight line at 4.8 km/h), 2-6 min.
+# Nørreport Metro -> S-tog (64 m apart) comes out at ~2.2 min.
+CROSS_STOP_TRANSFER_BASE_SECONDS = 60
+CROSS_STOP_TRANSFER_DETOUR = 1.5
+CROSS_STOP_TRANSFER_RANGE_SECONDS = (120, 360)
+# Changes between nearby stations (e.g. metro to a bus stop outside) get a direct edge with the
+# timetable's wait when that beats walking over the street and waiting the average.
+WALK_TRANSFER_RADIUS = 250.0
+WALK_TRANSFER_DETOUR = 1.3
+WALK_TRANSFER_MIN_GAIN_MINUTES = 0.5
+WALK_METERS_PER_SECOND = 4800 / 3600
 
 LonLat = Tuple[float, float]
 
@@ -276,22 +288,35 @@ def build_network(city: City = COPENHAGEN) -> dict:
     def in_window(seconds: int) -> bool:
         return SERVICE_WINDOW[0] <= seconds < SERVICE_WINDOW[1]
 
-    # Daytime departures per line between consecutive stations, and of those, per pair of hops a
-    # train makes in a row. Lines are counted as a whole (all DSB trains, say), so a stretch several
-    # services share gets their combined frequency.
+    # Daytime departures per mode between consecutive stations, and of those, per pair of hops a
+    # train makes in a row. All lines of a mode are counted together, so where several lines run the
+    # same way (S-tog A, B, C, E toward Hellerup; T17/T18/T19 toward T-Centralen; buses 5C and 350S)
+    # you take whichever comes first and the wait reflects their combined frequency. Riding on past
+    # a station where some of them turn off adds the wait for one that goes your way (see below).
+    # Routes with no regular daytime service (night buses, a few peak-only extras) would otherwise
+    # look available all day; leave them out, and don't count them toward anyone's wait either.
+    route_hop_departures: Counter = Counter()
+    for trip_id, run in runs.items():
+        for k in range(len(run) - 1):
+            if in_window(run[k][3]):
+                route_hop_departures[(trips[trip_id]["route"], run[k][0], run[k + 1][0])] += 1
+    active_routes = {route_key for (route_key, _a, _b), count in route_hop_departures.items() if count >= 2}
+
     hop_departures: Counter = Counter()
     through_departures: Counter = Counter()
+    # All departure times per (mode, station, next station), for timetable waits at changes.
+    hop_departure_times: Dict[Tuple[str, int, int], List[int]] = defaultdict(list)
     for trip_id, run in runs.items():
-        route_key = trips[trip_id]["route"]
+        if trips[trip_id]["route"] not in active_routes:
+            continue
+        mode = trips[trip_id]["mode"]
         for k in range(len(run) - 1):
+            hop_departure_times[(mode, run[k][0], run[k + 1][0])].append(run[k][3])
             if not in_window(run[k][3]):
                 continue
-            hop_departures[(route_key, run[k][0], run[k + 1][0])] += 1
+            hop_departures[(mode, run[k][0], run[k + 1][0])] += 1
             if k:
-                through_departures[(route_key, run[k - 1][0], run[k][0], run[k + 1][0])] += 1
-    # Routes with no regular daytime service (night buses, a few peak-only extras) would otherwise
-    # look available all day; leave them out.
-    active_routes = {route_key for (route_key, _a, _b), count in hop_departures.items() if count >= 2}
+                through_departures[(mode, run[k - 1][0], run[k][0], run[k + 1][0])] += 1
 
     # Split each line into services: trips with the same stopping pattern, with short workings
     # (a contiguous part of a longer pattern) folded into the longer one. You can only stay on board
@@ -349,10 +374,10 @@ def build_network(city: City = COPENHAGEN) -> dict:
     dwell = {key: round(statistics.median(values), 2) for key, values in dwells.items()}
 
     # Expected waits are half the daytime headway, 1.5–30 min. Boarding a service costs the wait for
-    # its next hop, counting every train of the line that makes that hop. Staying on past a station
-    # where fewer of the line's trains continue (Glostrup, for the hourly airport train) adds the
-    # difference there: the wait for a train that does both hops, less the wait already counted for
-    # the hop before.
+    # its next hop, counting every train of its mode that makes that hop. Staying on past a station
+    # where fewer of those trains continue (Glostrup, for the hourly airport train; Hellerup, where
+    # S-tog lines split) adds the difference there: the wait for a train that does both hops, less
+    # the wait already counted for the hop before.
     window_minutes = (SERVICE_WINDOW[1] - SERVICE_WINDOW[0]) / 60.0
 
     def expected_wait(departures: int) -> float:
@@ -363,17 +388,17 @@ def build_network(city: City = COPENHAGEN) -> dict:
     state_waits: Dict[Tuple[int, int], float] = {}
     edge_extra_waits: Dict[Tuple[int, int, int], float] = {}
     for service, stations_ in enumerate(service_stations):
-        route_key = service_routes[service]
+        mode = route_modes[service_routes[service]]
         for k in range(len(stations_) - 1):
             here, after = stations_[k], stations_[k + 1]
-            wait = expected_wait(hop_departures[(route_key, here, after)])
+            wait = expected_wait(hop_departures[(mode, here, after)])
             extra = 0.0
             if k:
                 before = stations_[k - 1]
                 extra = max(
                     0.0,
-                    expected_wait(through_departures[(route_key, before, here, after)])
-                    - expected_wait(hop_departures[(route_key, before, here)]),
+                    expected_wait(through_departures[(mode, before, here, after)])
+                    - expected_wait(hop_departures[(mode, before, here)]),
                 )
                 # Someone boarding here pays at least the dwell (the app takes it off the wait), so
                 # keep wait + extra at the full wait even when the train stands here a while.
@@ -410,7 +435,10 @@ def build_network(city: City = COPENHAGEN) -> dict:
             return route_transfers[(from_stop, to_stop, from_route, to_route)]
         if (from_stop, to_stop) in stop_transfers:
             return stop_transfers[(from_stop, to_stop)]
-        return DEFAULT_SAME_STOP_TRANSFER_SECONDS if from_stop == to_stop else DEFAULT_CROSS_STOP_TRANSFER_SECONDS
+        if from_stop == to_stop:
+            return DEFAULT_SAME_STOP_TRANSFER_SECONDS
+        walk = meters_between(stops[from_stop]["point"], stops[to_stop]["point"]) * CROSS_STOP_TRANSFER_DETOUR / WALK_METERS_PER_SECOND
+        return round(clamp(CROSS_STOP_TRANSFER_BASE_SECONDS + walk, *CROSS_STOP_TRANSFER_RANGE_SECONDS))
 
     # Where each service comes from and goes next at each station, for pruning useless transfers.
     previous_stations: Dict[Tuple[int, int], set] = defaultdict(set)
@@ -423,6 +451,53 @@ def build_network(city: City = COPENHAGEN) -> dict:
     for station, service in sorted(service_stops):
         station_services[station].append(service)
 
+    # Timetable waits at changes. Journey planners pick an actual connection, so a change to a line
+    # timed to meet yours (buses meeting trains, Ropsten → Lidingö) costs less than the average wait,
+    # and a badly timed one more. For each daytime arrival of the service you're on, take the next
+    # departure your way after the transfer walk, and average. Like the state waits, "your way" is
+    # any train of the mode making the next hop; riding past a split adds its extra wait later.
+    for hop_times in hop_departure_times.values():
+        hop_times.sort()
+    service_arrivals: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for service, trip_ids in enumerate(service_trips):
+        for trip_id in trip_ids:
+            for k, (station, _stop, arrival, _departure) in enumerate(runs[trip_id]):
+                if k and in_window(arrival):
+                    service_arrivals[(station, service)].append(arrival)
+
+    def timetable_wait(from_station: int, a: int, to_station: int, b: int, transfer_s: float) -> float | None:
+        """Expected minutes from being ready (arrival + transfer) to b's departure, less the extra
+        wait its ride edges will add; None if service a has no daytime arrivals here."""
+        arrivals = service_arrivals.get((from_station, a))
+        if not arrivals:
+            return None
+        mode = route_modes[service_routes[b]]
+        best = None
+        for after in next_stations[(to_station, b)]:
+            times = hop_departure_times.get((mode, to_station, after))
+            if not times:
+                continue
+            total = 0.0
+            for arrival in arrivals:
+                ready = arrival + transfer_s
+                index = bisect.bisect_left(times, ready)
+                total += min(times[index] - ready, MAX_WAIT * 60) if index < len(times) else MAX_WAIT * 60
+            average = total / len(arrivals) / 60.0
+            # state_waits[(station, b)] is the average wait less the extra charged on b's next ride
+            # edge; take the same extra off here so the change and the ride add up to `average`.
+            extra = max(0.0, expected_wait(hop_departures[(mode, to_station, after)]) - state_waits.get((to_station, b), 0.0))
+            value = max(0.0, average - extra)
+            best = value if best is None else min(best, value)
+        return best
+
+    depth = PlatformDepth(city)
+    access: Dict[Tuple[int, int], float] = {}
+    for (station, service), counter in service_stops.items():
+        lon, lat = stops[counter.most_common(1)[0][0]]["point"]
+        access[(station, service)] = depth.access_minutes(
+            route_modes[service_routes[service]], lon, lat, complexes[station]["name"]
+        )
+
     # Drop complexes no modelled service actually stops at, then re-index.
     keep = sorted(station_services)
     remap = {old: new for new, old in enumerate(keep)}
@@ -434,20 +509,21 @@ def build_network(city: City = COPENHAGEN) -> dict:
         services_here = station_services[old]
         stops_used = {service: service_stops[(old, service)].most_common(1)[0][0] for service in services_here}
         # Changing is only useful from a service that arrives here to one that leaves, and not onto
-        # the same line heading back where you came from.
-        transfers = [
-            [
-                service_ids[a],
-                service_ids[b],
-                transfer_seconds(stops_used[a], stops_used[b], service_routes[a], service_routes[b]),
-            ]
-            for a in services_here
-            for b in services_here
-            if a != b
-            and previous_stations[(old, a)]
-            and next_stations[(old, b)]
-            and not (service_routes[a] == service_routes[b] and next_stations[(old, b)] & previous_stations[(old, a)])
-        ]
+        # the same line heading back where you came from. Each change is [from, to, minimum transfer
+        # seconds, timetable wait in minutes (or null: use the average)].
+        transfers = []
+        for a in services_here:
+            for b in services_here:
+                if (
+                    a == b
+                    or not previous_stations[(old, a)]
+                    or not next_stations[(old, b)]
+                    or (service_routes[a] == service_routes[b] and next_stations[(old, b)] & previous_stations[(old, a)])
+                ):
+                    continue
+                seconds = transfer_seconds(stops_used[a], stops_used[b], service_routes[a], service_routes[b])
+                wait = timetable_wait(old, a, old, b, seconds)
+                transfers.append([service_ids[a], service_ids[b], seconds, None if wait is None else round(wait, 2)])
         routes_here = sorted({service_routes[service] for service in services_here})
         stations.append(
             {
@@ -466,6 +542,7 @@ def build_network(city: City = COPENHAGEN) -> dict:
                         "route": service_routes[service],
                         "stop": stops_used[service],
                         "dwell": dwell.get((old, service), 0.0),
+                        "access": access[(old, service)],
                         # A service's last stop has nothing to board.
                         "wait": round(state_waits.get((old, service), MAX_WAIT), 2),
                     }
@@ -474,6 +551,43 @@ def build_network(city: City = COPENHAGEN) -> dict:
                 "transfers": transfers,
             }
         )
+
+    # Changes between nearby stations: [from station, from service, to station, to service, walk
+    # seconds (platform to street, the walk, street to platform), timetable wait in minutes]. Only
+    # kept where the timetable makes the change clearly quicker than the street route, which pays
+    # the average wait; otherwise the street route already covers it.
+    stop_of = {(station, service): counter.most_common(1)[0][0] for (station, service), counter in service_stops.items()}
+    near_cells: Dict[Tuple[int, int], List[Tuple[int, int, LonLat]]] = defaultdict(list)
+    cell_deg = WALK_TRANSFER_RADIUS / 111_320.0
+    for (station, service), stop_id in stop_of.items():
+        if station in remap:
+            point = stops[stop_id]["point"]
+            near_cells[(math.floor(point[1] / cell_deg), math.floor(point[0] / (2 * cell_deg)))].append((station, service, point))
+    walk_transfers = []
+    for (from_station, a), stop_id in sorted(stop_of.items()):
+        if from_station not in remap or not previous_stations[(from_station, a)]:
+            continue
+        point = stops[stop_id]["point"]
+        ci, cj = math.floor(point[1] / cell_deg), math.floor(point[0] / (2 * cell_deg))
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for to_station, b, to_point in near_cells.get((ci + di, cj + dj), ()):
+                    if to_station == from_station or not next_stations[(to_station, b)]:
+                        continue
+                    if service_routes[a] == service_routes[b] or next_stations[(to_station, b)] & previous_stations[(from_station, a)]:
+                        continue
+                    meters = meters_between(point, to_point)
+                    if meters > WALK_TRANSFER_RADIUS:
+                        continue
+                    seconds = (access[(from_station, a)] + access[(to_station, b)]) * 60 + meters * WALK_TRANSFER_DETOUR / WALK_METERS_PER_SECOND
+                    wait = timetable_wait(from_station, a, to_station, b, seconds)
+                    if wait is None or wait > state_waits.get((to_station, b), MAX_WAIT) - WALK_TRANSFER_MIN_GAIN_MINUTES:
+                        continue
+                    walk_transfers.append(
+                        [remap[from_station], service_ids[a], remap[to_station], service_ids[b], round(seconds), round(wait, 2)]
+                    )
+    print(f"  {len(walk_transfers)} timed changes between nearby stations")
+
     edges = [
         [
             remap[a],
@@ -530,12 +644,14 @@ def build_network(city: City = COPENHAGEN) -> dict:
     return {
         "version": CACHE_VERSION,
         "gtfs": gtfs_signature(gtfs_dir),
+        "platforms": platform_signature(city),
         "serviceDate": service_date,
         "modes": list(city.modes),
         "routes": routes,
         "services": {service_id: service_routes[index] for index, service_id in enumerate(service_ids)},
         "stations": stations,
         "edges": edges,
+        "walkTransfers": walk_transfers,
         "shapes": shapes,
     }
 
@@ -544,7 +660,11 @@ def load_network(force: bool = False, city: City = COPENHAGEN) -> dict:
     cache_path = city.transit_cache_path
     if not force and cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if cached.get("version") == CACHE_VERSION and cached.get("gtfs") == gtfs_signature(city.gtfs_dir):
+        if (
+            cached.get("version") == CACHE_VERSION
+            and cached.get("gtfs") == gtfs_signature(city.gtfs_dir)
+            and cached.get("platforms") == platform_signature(city)
+        ):
             return cached
     if not (city.gtfs_dir / "stop_times.txt").exists():
         raise SystemExit(f"{city.gtfs_dir} has no GTFS feed; run `python3 setup_data.py --city {city.id}` first.")

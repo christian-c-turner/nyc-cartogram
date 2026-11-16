@@ -87,7 +87,8 @@ setup, verification, and troubleshooting notes (written so a Claude agent can do
 
 ```bash
 # 1. OpenStreetMap layers via Overpass: municipalities, parks, water, major streets, the full
-#    walk/bike street network (fetched in tiles), and for Stockholm the coastline. Cached in data/
+#    walk/bike street network (fetched in tiles), rail tracks (for platform depth), and for Stockholm
+#    the coastline. Cached in data/
 #    as cph_* / sto_*; add --force to refresh.
 python3 fetch_cph_basemap.py --city stockholm
 
@@ -161,17 +162,47 @@ Moves between them:
 
 - **Street legs** are walked at 4.8 km/h or, with Bike on, ridden at 16 km/h (the usual journey-planner
   assumptions, as used by Google Maps). On walk-only edges you push the bike at walking speed.
-- **Boarding** from a station's street node costs the walk/ride to the platform, a per-mode platform access
-  time (Copenhagen: Metro/regional 2 min, S-tog 1.5, Letbane/harbour bus 0.5, bus 0.3; Stockholm:
-  tunnelbana/pendeltåg 2.5, tram/boat 0.5, bus 0.3; +0.5–1 min with a bike), and the
-  expected wait for a departure: half the 07:00–19:00 headway of the line's trains to the next station,
-  1.5–30 min. Staying on past a station where fewer of those trains continue adds the difference there
-  (e.g. ~26 min at Glostrup for the hourly airport train). **Alighting** costs the same minus the wait.
+- **Boarding** from a station's street node costs the walk/ride to the platform, a platform access time
+  that depends on the mode and on whether the platform is underground (+0.5–1 min with a bike):
+
+  | | street level | underground |
+  |---|---|---|
+  | Copenhagen Metro | 0.5 min | 1 |
+  | S-tog | 1 | 1.5 |
+  | Regional trains | 1.5 | 2 |
+  | Stockholm tunnelbana | 0.5 | 2 |
+  | Pendeltåg | 1 | 1.5 (Stockholms södra); 3 at City and Odenplan |
+  | Letbane, tram, boat / bus | 0.5 / 0.3 | |
+
+  A platform is underground when the OpenStreetMap track nearest its GTFS stop (`railway=subway` for
+  metros, `railway=rail` for trains) is tagged as a tunnel (`data/<prefix>_rail_tracks.json`); a few very deep stations have a fixed time
+  (`station_access_overrides` in `cities.py`). Changing any of these settings rebuilds the cached
+  transit network on the next build. The
+  values are calibrated against Google Maps on Nørreport → Lufthavnen and T-Centralen → Kista. Then
+  comes the
+  expected wait for a departure: half the 07:00–19:00 headway to the next station, 1.5–30 min, counting
+  every line of that mode that makes the hop (S-tog A, B, C, E, H between Nørreport and Østerport;
+  T17/T18/T19 into T-Centralen; buses 5C and 350S), since you take whichever comes first. Staying on
+  past a station where fewer of those trains continue adds the difference there: the wait for one that
+  goes your way (e.g. ~26 min at Glostrup for the hourly airport train). **Alighting** costs the same
+  minus the wait.
+- **Leave on time** (on by default, as Google Maps does): the first ride of a trip has no wait, as if you
+  left just in time for a departure that goes your way (so no extra wait where lines split either).
+  Changes still include the average wait. Turn it off (or add `timed=0` to a link) to leave at a random
+  moment and pay the average wait for the first ride too. The search keeps a second copy of the transit
+  states for the first ride, so it knows which ride is the first.
 - **Transfers** inside a station use the minimum platform-to-platform times from GTFS `transfers.txt`
-  (line-specific where given, e.g. 60 s cross-platform S-tog changes at København H), plus the wait
-  for the next service. You can't get round these by stepping out to the street and straight back in:
-  after leaving a train, the search won't board anything at that same station again. Transfers between
-  nearby stations (e.g. to a bus stop outside) simply happen on the street network.
+  (line-specific where given, e.g. 60 s cross-platform S-tog changes at København H; 2 min on the same
+  stop, and between different stops a minute plus the walk, 2–6 min, where the feed has none), plus the
+  **timetable's wait for that connection**: for every daytime arrival of the line you're on, the time
+  from being ready to the next departure your way, averaged. Journey planners pick actual connections,
+  so a change to a line timed to meet yours costs less than half its headway, and a badly timed one
+  more. You can't get round these by stepping out to the street and straight back in: after leaving a
+  train, the search won't board anything at that same station again.
+- **Changes between nearby stations** (within 250 m, e.g. from the metro to a bus stop outside) happen on
+  the street network with the average wait, plus a direct edge with the timetable's wait (walk at 1.3×
+  the straight line, plus platform times) where that is at least half a minute quicker. In the
+  itinerary these read "Change at Ropsten → Ropsten (bus) …" with a dashed line between the stops.
 - The **itinerary** splits a route into walk/bike legs (including getting to and from platforms), waits,
   changes, and rides; ride rows are in-vehicle time only.
 - **Grid cells** (50 m) take the time of their nearest street node plus the walk from it. Only nodes in

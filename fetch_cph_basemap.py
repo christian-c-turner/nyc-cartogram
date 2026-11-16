@@ -10,6 +10,7 @@ Writes, under data/ (shown with Copenhagen's "cph" prefix; see cities.py):
   osm_major_streets.json      motorway / trunk / primary roads (raw Overpass JSON)
   cph_street_network.json     every walkable/bikeable way in the area (raw Overpass JSON)
   cph_water.geojson           lakes, ponds, and canals inside the land area (e.g. Søerne)
+  cph_rail_tracks.json        rail/metro tracks and whether they are in a tunnel (platform depth)
   sto_coastline.json          natural=coastline ways (only for cities whose municipal boundaries
                               extend over the sea, i.e. Stockholm)
 
@@ -296,6 +297,35 @@ def fetch_coastline(city: City, force: bool) -> None:
     print(f"Wrote {city.coastline_path} ({len(ways)} ways)")
 
 
+def fetch_rail_tracks(city: City, force: bool) -> None:
+    """Rail, metro, and light-rail tracks with whether they run in a tunnel (for platform depth)."""
+    path = city.rail_tracks_path
+    if path.exists() and not force:
+        return
+    print("Fetching rail tracks…")
+    payload = overpass(
+        "[out:json][timeout:180];"
+        f'way["railway"~"^(subway|rail|light_rail|narrow_gauge)$"]{bbox_clause(city.street_bbox)};'
+        "out tags geom;"
+    )
+    ways = []
+    for element in payload["elements"]:
+        tags = element.get("tags", {})
+        if element["type"] != "way" or not element.get("geometry"):
+            continue
+        # tunnel=building_passage is a ground-level passage through a building, not a tunnel.
+        tunnel = tags.get("tunnel") == "yes" or tags.get("location") == "underground"
+        ways.append(
+            {
+                "railway": tags["railway"],
+                "tunnel": tunnel,
+                "points": [[round(node["lon"], 6), round(node["lat"], 6)] for node in element["geometry"]],
+            }
+        )
+    path.write_text(json.dumps({"ways": ways}, separators=(",", ":")), encoding="utf-8")
+    print(f"Wrote {path} ({len(ways)} ways, {sum(way['tunnel'] for way in ways)} in tunnels)")
+
+
 def fetch_street_network(city: City, force: bool) -> None:
     path = city.street_network_path
     if path.exists() and not force:
@@ -338,6 +368,7 @@ def main(argv: List[str] | None = None) -> None:
     fetch_parks(city, force)
     fetch_streets(city, force)
     fetch_water(city, force)
+    fetch_rail_tracks(city, force)
     fetch_street_network(city, force)
 
 
