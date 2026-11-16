@@ -30,12 +30,13 @@ What it does:
    Mobility Database's daily mirror, `https://files.mobilitydatabase.org/mdb-3237/latest.zip` (no
    API key needed). The `.txt` files are unzipped flat into the folder.
 2. **OpenStreetMap → `data/`** via the Overpass API (`fetch_cph_basemap.py`). Copenhagen's small
-   layers (municipalities, external land, parks, water, major streets) are committed, so only
-   `data/cph_street_network.json` (~73 MB, 12 tiles, 5–15 minutes) has to be fetched. For Stockholm
-   every layer is fetched: the same ones as `data/sto_*`, plus `data/sto_coastline.json` and the
-   street network in 16 tiles (15–30 minutes in all).
+   layers (municipalities, external land, parks, water, major streets, rail tracks) are committed, so
+   only `data/cph_street_network.json` (~73 MB, 12 tiles, 5–15 minutes) has to be fetched. For
+   Stockholm every layer is fetched: the same ones as `data/sto_*`, plus `data/sto_coastline.json` and
+   the street network in 16 tiles (15–30 minutes in all). `data/<prefix>_rail_tracks.json` (<1 MB,
+   one query) marks which platforms are underground; without it the build treats all as street level.
 3. **Build → `site/data/<city>/`** (`build_commute_site_data.py --city <id>`, 10–30 s):
-   `commute_map_data.json` (~4 MB Copenhagen, ~12 MB Stockholm) and `street_graph.bin` (~23 MB;
+   `commute_map_data.json` (~5 MB Copenhagen, ~13 MB Stockholm) and `street_graph.bin` (~23 MB;
    Stockholm's ~32 MB is split into `street_graph.bin` + `street_graph.1.bin` to stay under
    Cloudflare's 25 MiB asset limit, and the app joins the parts listed in `cities.json`), plus
    `site/data/cities.json`. The first build
@@ -63,14 +64,14 @@ python3 serve.py 8080      # all interfaces; handles /@lat,lon share links
     --window-size=1440,900 --virtual-time-budget=20000 --screenshot=/tmp/check.png \
     "http://localhost:8080/@55.68330,12.57170?distance=55.63040,12.64940&route=1"
   ```
-  Expect roughly "Fastest route · 24 min" via M2 from Nørreport to the airport.
+  Expect roughly "Fastest route · 19 min" via M2 from Nørreport to the airport (21 min with `&timed=0`).
 - The same for Stockholm (T-Centralen to Kista):
   ```bash
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new --hide-scrollbars \
     --window-size=1440,900 --virtual-time-budget=20000 --screenshot=/tmp/check-sto.png \
     "http://localhost:8080/@59.33100,18.06000?city=stockholm&distance=59.40300,17.94400&route=1"
   ```
-  Expect roughly "Fastest route · 31 min" via T11 from T-Centralen to Kista. The title should read "Stockholm" and the sea
+  Expect roughly "Fastest route · 24 min" via T11 from T-Centralen to Kista (29 min with `&timed=0`). The title should read "Stockholm" and the sea
   east of the city (Saltsjön) and Lake Mälaren to the west should be water, not heatmap.
 
 ### Troubleshooting
@@ -122,6 +123,7 @@ python3 serve.py 8080      # all interfaces; handles /@lat,lon share links
 - `setup_data.py`: fresh-clone setup (download + fetch + build), for every city or `--city <id>`
 - `fetch_cph_basemap.py`: Overpass downloads into `data/`
 - `cph_transit.py`: GTFS → stations, lines, ride times, waits, and transfer times (cached)
+- `platforms.py`: platform access times (underground where the OSM track at the stop is in a tunnel)
 - `cph_streets.py`: OSM ways → walk/bike street graph resampled to ≤20 m edges
 - `coastline.py`: OSM coastline ways → sea polygons (Stockholm)
 - `build_commute_site_data.py`: assembles `site/data/<city>/` (grid, land/water mask, station links,

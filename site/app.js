@@ -4,7 +4,7 @@ const cityDataUrl = (cityId, file) => new URL(`./data/${cityId}/${file}`, import
 const CITY_STORAGE_KEY = "commute-map-city-v1";
 const DEFAULT_MAX_TIME_MINUTES = 30;
 const MIN_VIEWPORT_SCALE = 1;
-const MAX_VIEWPORT_SCALE = 16;
+const MAX_VIEWPORT_SCALE = 64;
 const VIEWPORT_ZOOM_STEP = 1.4;
 const WHEEL_ZOOM_SENSITIVITY = 0.0015;
 const MAP_PADDING = 24;
@@ -44,6 +44,8 @@ const state = {
   ready: false,
   showHeatmap: true,
   showReachOutline: false,
+  // Leave just in time for the first departure (no wait before the first ride), as Google Maps does.
+  timedDeparture: true,
   showRoute: true,
   routeCache: null,
   routeStepsKey: "",
@@ -94,6 +96,7 @@ const settingsValueLabels = Array.from(document.querySelectorAll("[data-setting-
 const resetSettingsButton = document.getElementById("resetSettingsButton");
 const heatmapToggle = document.getElementById("heatmapToggle");
 const outlineToggle = document.getElementById("outlineToggle");
+const timedToggle = document.getElementById("timedToggle");
 const heatmapLegend = document.getElementById("heatmapLegend");
 const heatmapLegendMin = document.getElementById("heatmapLegendMin");
 const heatmapLegendMax = document.getElementById("heatmapLegendMax");
@@ -142,7 +145,7 @@ function sanitizeTravelSettings(rawSettings, defaults = state.travelSettingsDefa
   return {
     walkingSpeed: defaults.walkingSpeed,
     cyclingSpeed: defaults.cyclingSpeed,
-    maxTransitTime: clamp(pick("maxTransitTime"), 10, 120),
+    maxTransitTime: clamp(pick("maxTransitTime"), 5, 90),
   };
 }
 
@@ -815,7 +818,13 @@ function travelFieldKey(originPoint) {
     settings.cyclingSpeed.toFixed(2),
     settings.maxTransitTime,
     [...state.enabledModes].sort().join(","),
+    state.timedDeparture ? "timed" : "average",
   ].join("|");
+}
+
+// Minutes from a station's street entrance to this platform (more where it is underground).
+function platformMinutes(routeState) {
+  return routeState.access ?? state.data.meta.stationAccessMinutes[routeState.mode] ?? 1.5;
 }
 
 function computeTravelField(originPoint) {
@@ -829,25 +838,34 @@ function computeTravelField(originPoint) {
   const walkSpeed = settings.walkingSpeed;
   const streetSpeed = bike ? settings.cyclingSpeed : walkSpeed;
   const nodeCount = g.nodeCount;
-  const times = new Float64Array(nodeCount + routeStates.length).fill(Infinity);
+  // Search nodes: street nodes, then the (station, service) states, then (when leaving on time) a
+  // second copy of the states for the first ride of a trip (no wait for the right train).
+  const stateCount = routeStates.length;
+  const firstBase = nodeCount + stateCount;
+  const times = new Float64Array(firstBase + stateCount).fill(Infinity);
   // Predecessor of each node on its fastest path, for drawing routes.
-  const previous = new Int32Array(nodeCount + routeStates.length).fill(-1);
+  const previous = new Int32Array(firstBase + stateCount).fill(-1);
   const cutoff = Math.max(MIN_SEARCH_MINUTES, settings.maxTransitTime) + SEARCH_CUTOFF_EXTRA_MINUTES;
 
   const boardCost = new Float32Array(routeStates.length);
+  // Boarding before any ride when leaving on time: no wait, so the train departs as you reach the
+  // platform (its dwell is already in the ride, which is timed from arrival at the station).
+  const firstBoardCost = new Float32Array(routeStates.length);
   const alightCost = new Float32Array(routeStates.length);
   const noBikeModes = meta.noBikeModes ?? ["bus"];
   routeStates.forEach((routeState, index) => {
-    const platform =
-      (meta.stationAccessMinutes[routeState.mode] ?? 1.5) + (bike ? meta.bikeStationExtraMinutes[routeState.mode] ?? 1 : 0);
+    const platform = platformMinutes(routeState) + (bike ? meta.bikeStationExtraMinutes[routeState.mode] ?? 1 : 0);
     alightCost[index] = routeState.linkMeters / streetSpeed + platform;
     // Some modes don't take bikes (buses; in Stockholm also the tunnelbana and trams), so with the
     // bike on they can't be boarded. Rides are timed from arrival at each station, so the service's
     // dwell there comes off the wait for its departure.
-    boardCost[index] =
-      bike && noBikeModes.includes(routeState.mode)
-        ? Infinity
-        : alightCost[index] + Math.max(0, routeState.wait - (routeState.dwell ?? 0));
+    const noBike = bike && noBikeModes.includes(routeState.mode);
+    boardCost[index] = noBike ? Infinity : alightCost[index] + Math.max(0, routeState.wait - (routeState.dwell ?? 0));
+    firstBoardCost[index] = noBike
+      ? Infinity
+      : state.timedDeparture
+        ? Math.max(0, alightCost[index] - (routeState.dwell ?? 0))
+        : boardCost[index];
   });
 
   // For each street node, the station where the fastest path to it last left a train (-1 if none).
@@ -891,16 +909,36 @@ function computeTravelField(originPoint) {
         const routeStateIndex = g.boardStates[k];
         if (!state.routeStateEnabled[routeStateIndex]) continue;
         if (routeStates[routeStateIndex].stationIndex === currentAlightedAt) continue;
-        relax(nodeCount + routeStateIndex, time + boardCost[routeStateIndex]);
+        if (currentAlightedAt === -1 && state.timedDeparture) {
+          relax(firstBase + routeStateIndex, time + firstBoardCost[routeStateIndex]);
+        } else {
+          relax(nodeCount + routeStateIndex, time + boardCost[routeStateIndex]);
+        }
       }
     } else {
-      const routeStateIndex = current - nodeCount;
+      // On the first ride when leaving on time, you board a train that goes your way, so staying on
+      // past a station where some trains turn off costs no extra wait. Changing to another service
+      // leaves the first ride.
+      const firstRide = current >= firstBase;
+      const routeStateIndex = current - (firstRide ? firstBase : nodeCount);
+      const service = routeStates[routeStateIndex].service;
       currentAlightedAt = routeStates[routeStateIndex].stationIndex;
-      for (const [target, weight] of adjacency[routeStateIndex]) {
-        if (state.routeStateEnabled[target]) relax(nodeCount + target, time + weight);
+      // Changes (to another service) are timed from arriving on this one, so they only apply after
+      // riding it here: not to a train just boarded from the street or reached by another change.
+      const before = previous[current];
+      const arrivedByRide =
+        before >= nodeCount && routeStates[before - (before >= firstBase ? firstBase : nodeCount)].service === service;
+      for (const [target, weight, extra = 0] of adjacency[routeStateIndex]) {
+        if (!state.routeStateEnabled[target]) continue;
+        const sameService = routeStates[target].service === service;
+        if (!arrivedByRide && !sameService) continue;
+        if (firstRide && sameService) relax(firstBase + target, time + weight - extra);
+        // Changing onto a service you can't take a bike on is as impossible as boarding it.
+        else if (sameService || boardCost[target] !== Infinity) relax(nodeCount + target, time + weight);
       }
+      // Likewise you can only get off after riding (not use a change as a shortcut to another stop).
       const exitNode = routeStates[routeStateIndex].node;
-      if (exitNode >= 0) relax(exitNode, time + alightCost[routeStateIndex]);
+      if (exitNode >= 0 && arrivedByRide) relax(exitNode, time + alightCost[routeStateIndex]);
     }
   }
 
@@ -1057,9 +1095,14 @@ function buildRouteLegs(field, chain, end) {
     else legs.push({ type: field.bike ? "bike" : "walk", points: [], meters: 0, minutes });
   };
 
+  // Search node -> routeStates index (transit nodes come in two copies; see computeTravelField).
+  const firstBase = nodeCount + routeStates.length;
+  const stateOf = (value) => routeStates[value - (value >= firstBase ? firstBase : nodeCount)];
+  const stateIndexOf = (value) => value - (value >= firstBase ? firstBase : nodeCount);
+
   const stationAccessMinutes = (routeState) =>
     routeState.linkMeters / streetSpeed +
-    (meta.stationAccessMinutes[routeState.mode] ?? 1.5) +
+    platformMinutes(routeState) +
     (field.bike ? meta.bikeStationExtraMinutes[routeState.mode] ?? 1 : 0);
 
   let index = 0;
@@ -1091,7 +1134,7 @@ function buildRouteLegs(field, chain, end) {
     // continue); that is really time spent waiting for the right train, so it moves to the wait row.
     let runEnd = index;
     while (runEnd + 1 < chain.length && chain[runEnd + 1] >= nodeCount) runEnd += 1;
-    const firstState = routeStates[chain[index] - nodeCount];
+    const firstState = stateOf(chain[index]);
     const access = stationAccessMinutes(firstState);
     const platformTime = (index > 0 ? times[chain[index - 1]] : 0) + access;
     addStationAccess(access);
@@ -1100,33 +1143,46 @@ function buildRouteLegs(field, chain, end) {
     let readyTime = platformTime; // when the traveller is on the platform for the next line
     for (let k = index; k <= runEnd; k += 1) {
       const lastOfGroup =
-        k === runEnd || routeStates[chain[k + 1] - nodeCount].service !== routeStates[chain[k] - nodeCount].service;
+        k === runEnd || stateOf(chain[k + 1]).service !== stateOf(chain[k]).service;
       if (!lastOfGroup) continue;
-      const group = chain.slice(groupStart, k + 1).map((value) => routeStates[value - nodeCount]);
+      const group = chain.slice(groupStart, k + 1).map(stateOf);
       const routeId = group[0].routeId;
       const style = routeStyles[routeId] ?? {};
       const label = style.label ?? routeId;
       // Extra wait still to come after each stop of the ride.
       const extraAfter = new Array(group.length).fill(0);
       for (let hop = group.length - 2; hop >= 0; hop -= 1) {
-        const from = chain[groupStart + hop] - nodeCount;
-        const to = chain[groupStart + hop + 1] - nodeCount;
+        const from = stateIndexOf(chain[groupStart + hop]);
+        const to = stateIndexOf(chain[groupStart + hop + 1]);
         const entry = adjacency[from].find(([target]) => target === to);
-        extraAfter[hop] = extraAfter[hop + 1] + (entry?.[2] ?? 0);
+        // The first ride when leaving on time has no extra wait (see computeTravelField).
+        const extra = chain[groupStart + hop + 1] >= firstBase ? 0 : entry?.[2] ?? 0;
+        extraAfter[hop] = extraAfter[hop + 1] + extra;
       }
       const departure = times[chain[groupStart]] + (group[0].dwell ?? 0) + extraAfter[0];
       const arrival = times[chain[k]];
       const stationIndexes = group.map((routeState) => routeState.stationIndex);
 
       if (groupStart === index) {
-        legs.push({ type: "wait", label, color: style.color, textColor: style.textColor, minutes: departure - readyTime });
+        if (chain[groupStart] >= firstBase) {
+          // Leaving on time there is no wait. Any remainder is the train standing at the platform
+          // while you get there (its dwell is part of the ride), so it goes with the walk to it.
+          if (departure > readyTime) addStationAccess(departure - readyTime);
+        } else {
+          legs.push({ type: "wait", label, color: style.color, textColor: style.textColor, minutes: departure - readyTime });
+        }
       } else {
+        // A change can be a short walk to a nearby station (e.g. from the metro to a bus stop).
+        const fromStation = stations[stateOf(chain[groupStart - 1]).stationIndex];
+        const toStation = stations[stationIndexes[0]];
+        const walked = fromStation !== toStation;
         legs.push({
           type: "change",
           label,
           color: style.color,
           textColor: style.textColor,
-          at: stations[stationIndexes[0]].name,
+          at: walked ? `${fromStation.name} → ${toStation.name}` : toStation.name,
+          points: walked ? [fromStation.point, toStation.point] : [],
           minutes: departure - readyTime,
         });
       }
@@ -1263,6 +1319,7 @@ function renderRouteSteps(route) {
   const key = route
     ? JSON.stringify([
         state.originLabel,
+        state.timedDeparture,
         route.legs.map((leg) => [leg.type, leg.label, leg.from, leg.to, leg.at, Math.round(leg.minutes), Math.round(leg.meters ?? 0)]),
       ])
     : "";
@@ -1297,12 +1354,15 @@ function renderRouteSteps(route) {
       return row(`<span class="route-chip route-chip-${leg.type}">${label}</span>`, distanceText, leg.minutes);
     })
     .join("");
+  const waitNote = state.timedDeparture
+    ? "Leaves in time for the first departure; changes include the typical wait for the connection in the timetable."
+    : "Waits are averages based on how often each line runs; changes use the typical wait for the connection in the timetable.";
   // The brief list and the full breakdown are both rendered; "Trip details" switches between them.
   routeSteps.innerHTML = `${routeTimeBar(route)}<p class="route-total">Fastest route · <strong>${formatMinutes(route.total)}</strong></p>
     <ol class="route-brief">${rows}</ol>
     <div class="trip-details"><ol class="trip-timeline">${tripTimelineHtml(route)}</ol></div>
     <ul class="trip-summary">${tripSummaryHtml(route)}</ul>
-    <p class="route-note"><span class="trip-details-only">Left column: minutes since leaving the start pin. </span>Walks include getting to and from platforms. Waits and changes are averages based on how often each line runs.</p>`;
+    <p class="route-note"><span class="trip-details-only">Left column: minutes since leaving the start pin. </span>Walks include getting to and from platforms. ${waitNote}</p>`;
   routeSteps.hidden = false;
   syncTripDetailsToggle();
 }
@@ -1381,7 +1441,7 @@ function tripTimelineHtml(route) {
       return;
     }
     if (leg.type === "change") {
-      steps.push(step(startedAt, `Change to ${escapeHtml(leg.label)}`, `at ${leg.at} · includes the average wait`, leg.minutes));
+      steps.push(step(startedAt, `Change to ${escapeHtml(leg.label)}`, `at ${leg.at} · includes ${leg.points?.length ? "the walk and " : ""}the typical wait for this connection`, leg.minutes));
       return;
     }
     const verb = leg.type === "bike" ? "Bike" : "Walk";
@@ -2248,6 +2308,7 @@ function buildViewUrlFragment() {
   }
   if (!state.showHeatmap) params.set("heatmap", "0");
   if (state.showReachOutline) params.set("outline", "1");
+  if (!state.timedDeparture) params.set("timed", "0");
   if (!state.showRoute) params.set("route", "0");
   const defaultModes = defaultModeIds();
   const modesAreDefault =
@@ -2271,6 +2332,7 @@ function parseSharedView() {
     view: viewMatch ? { lat: Number(viewMatch[1]), lon: Number(viewMatch[2]), zoom: Number(viewMatch[3]) } : null,
     heatmap: searchParams.has("heatmap") ? searchParams.get("heatmap") !== "0" : null,
     outline: searchParams.has("outline") ? searchParams.get("outline") !== "0" : null,
+    timed: searchParams.has("timed") ? searchParams.get("timed") !== "0" : null,
     route: searchParams.has("route") ? searchParams.get("route") !== "0" : null,
     modes: modesRaw === null ? null : modesRaw === "none" ? [] : modesRaw.split(","),
   };
@@ -2502,6 +2564,7 @@ async function init() {
   const shared = parseSharedView();
   if (shared.heatmap !== null) state.showHeatmap = shared.heatmap;
   if (shared.outline !== null) state.showReachOutline = shared.outline;
+  if (shared.timed !== null) state.timedDeparture = shared.timed;
   if (shared.route !== null) state.showRoute = shared.route;
   renderModeToggles();
   applyEnabledModes(shared.modes ?? loadStoredModes(), { persist: shared.modes === null });
@@ -2523,6 +2586,7 @@ async function init() {
 
   heatmapToggle.checked = state.showHeatmap;
   outlineToggle.checked = state.showReachOutline;
+  timedToggle.checked = state.timedDeparture;
   syncTravelSettingsInputs();
   syncHeatmapLegend();
   rebuildTransform();
@@ -2568,9 +2632,12 @@ async function init() {
     });
   }
   resetSettingsButton.addEventListener("click", () => {
+    state.timedDeparture = true;
+    timedToggle.checked = true;
     applyTravelSettings(state.travelSettingsDefaults);
     applyEnabledModes(defaultModeIds());
     syncBrowserUrl();
+    invalidate();
   });
   heatmapToggle.addEventListener("change", () => {
     state.showHeatmap = heatmapToggle.checked;
@@ -2598,6 +2665,11 @@ async function init() {
   });
   outlineToggle.addEventListener("change", () => {
     state.showReachOutline = outlineToggle.checked;
+    syncBrowserUrl();
+    invalidate();
+  });
+  timedToggle.addEventListener("change", () => {
+    state.timedDeparture = timedToggle.checked;
     syncBrowserUrl();
     invalidate();
   });

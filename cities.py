@@ -55,6 +55,13 @@ class City:
     route_text_colors: Dict[str, str] = field(default_factory=dict)
     # Minutes from the street to the platform (and back), per mode; bikes add lift/ramp time.
     station_access_minutes: Dict[str, float] = field(default_factory=dict)
+    # The same for underground platforms: a rail stop is underground when the nearest track of its
+    # kind (track_railway, an OSM railway=* value) runs in a tunnel. Modes not listed are never.
+    underground_access_minutes: Dict[str, float] = field(default_factory=dict)
+    track_railway: Dict[str, str] = field(default_factory=dict)
+    # Per mode, stations (by their name in the transit network) whose platforms take a set time
+    # regardless, e.g. Stockholm's very deep City and Odenplan commuter-rail platforms.
+    station_access_overrides: Dict[str, Dict[str, float]] = field(default_factory=dict)
     bike_station_extra_minutes: Dict[str, float] = field(default_factory=dict)
     # Modes that can't be boarded with a bike.
     no_bike_modes: Tuple[str, ...] = ("bus",)
@@ -101,6 +108,10 @@ class City:
     @property
     def major_streets_path(self) -> Path:
         return DATA_DIR / (self.major_streets_file or f"{self.prefix}_major_streets.json")
+
+    @property
+    def rail_tracks_path(self) -> Path:
+        return self.data_path("rail_tracks.json")
 
     @property
     def street_network_path(self) -> Path:
@@ -225,8 +236,11 @@ COPENHAGEN = City(
         "L": "#5E6F82",
     },
     route_text_colors={"M2": "#17304D", "F": "#17304D", "Bx": "#17304D"},
-    # Deep metro and mainline stations take longer than street-level light rail and harbour-bus stops.
-    station_access_minutes={"metro": 2.0, "stog": 1.5, "regional": 2.0, "letbane": 0.5, "harbour": 0.5, "bus": 0.3},
+    # Underground metro and mainline platforms take longer than street-level ones. Calibrated so
+    # Nørreport → Lufthavnen comes out close to journey planners (Google Maps: ~18 min).
+    station_access_minutes={"metro": 0.5, "stog": 1.0, "regional": 1.5, "letbane": 0.5, "harbour": 0.5, "bus": 0.3},
+    underground_access_minutes={"metro": 1.0, "stog": 1.5, "regional": 2.0},
+    track_railway={"metro": "subway", "stog": "rail", "regional": "rail"},
     bike_station_extra_minutes={"metro": 1.0, "stog": 1.0, "regional": 1.0, "letbane": 0.5, "harbour": 0.5, "bus": 0.0},
     # Bikes aren't allowed on Movia buses.
     no_bike_modes=("bus",),
@@ -340,8 +354,14 @@ STOCKHOLM = City(
         "L30": STO_TVARBANAN,
         "L31": STO_TVARBANAN,
     },
-    # The tunnelbana and the City/Odenplan commuter platforms are deep underground.
-    station_access_minutes={"metro": 2.5, "pendeltag": 2.5, "tram": 0.5, "boat": 0.5, "bus": 0.3},
+    # Underground tunnelbana stations are mostly deep rock caverns; surface stations are a staircase
+    # away. Calibrated so T-Centralen → Kista (underground to surface) comes out close to journey
+    # planners (Google Maps: ~24 min). Commuter-rail platforms in a tunnel are mostly shallow
+    # (Stockholms södra), except Citybanan's City (in the T-Centralen complex) and Odenplan, ~40 m down.
+    station_access_minutes={"metro": 0.5, "pendeltag": 1.0, "tram": 0.5, "boat": 0.5, "bus": 0.3},
+    underground_access_minutes={"metro": 2.0, "pendeltag": 1.5},
+    track_railway={"metro": "subway", "pendeltag": "rail"},
+    station_access_overrides={"pendeltag": {"T-Centralen": 3.0, "Odenplan": 3.0}},
     bike_station_extra_minutes={"metro": 1.0, "pendeltag": 1.0, "tram": 0.5, "boat": 0.5, "bus": 0.0},
     # SL takes bikes on the pendeltåg (off-peak) and the commuter boats only.
     no_bike_modes=("bus", "metro", "tram"),

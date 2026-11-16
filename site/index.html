@@ -66,7 +66,7 @@
               <span>Max travel time</span>
               <strong data-setting-value="maxTransitTime">30 min</strong>
             </span>
-            <input data-setting-key="maxTransitTime" data-setting-unit="minutes" type="range" min="10" max="120" step="5" />
+            <input data-setting-key="maxTransitTime" data-setting-unit="minutes" type="range" min="5" max="90" step="5" />
           </label>
         </div>
         <div class="control-row">
@@ -79,6 +79,11 @@
             <input id="outlineToggle" type="checkbox" />
             <span class="switch-track"><span class="switch-thumb"></span></span>
             <span>Max-time outline</span>
+          </label>
+          <label class="switch" title="Leave just in time for the first departure, as Google Maps does. Off: leave at a random moment and wait the line's average.">
+            <input id="timedToggle" type="checkbox" />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+            <span>Leave on time</span>
           </label>
         </div>
         <div class="control-actions">

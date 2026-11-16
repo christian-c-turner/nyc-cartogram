@@ -425,8 +425,9 @@ def rasterize_land(land: MultiPolygon, bounds: BBox, cols: int, rows: int) -> Li
 
 
 def build_transit(
-    network: dict, lat0: float, node_index: cph_streets.NodeIndex, bounds: BBox
+    network: dict, lat0: float, node_index: cph_streets.NodeIndex, bounds: BBox, city: City
 ) -> Tuple[list, list, list, list]:
+    underground_stops = 0
     linkable = expand_bbox(bounds, 1_000.0)
     stations = []
     route_states = []
@@ -448,6 +449,10 @@ def build_transit(
         # One state per (station, service): a direction and stopping pattern of a line.
         for service_id, service in sorted(station["services"].items()):
             node, meters = stop_links[service["stop"]]
+            mode = network["routes"][service["route"]]["mode"]
+            # Minutes from the street to this platform (more where it is underground; platforms.py).
+            access = service["access"]
+            underground_stops += access > city.station_access_minutes.get(mode, 1.5)
             state_index[(station_index, service_id)] = len(route_states)
             states.append(len(route_states))
             route_states.append(
@@ -455,9 +460,10 @@ def build_transit(
                     "stationIndex": station_index,
                     "routeId": service["route"],
                     "service": service_numbers[service_id],
-                    "mode": network["routes"][service["route"]]["mode"],
+                    "mode": mode,
                     "node": node,
                     "linkMeters": round(meters, 1),
+                    "access": access,
                     "dwell": service["dwell"],
                     "wait": service["wait"],
                 }
@@ -484,13 +490,29 @@ def build_transit(
             adjacency[a][b] = [weight, extra_wait] if extra_wait > 0 else [weight]
     # In-station transfers: GTFS minimum transfer time plus the expected wait for the next service's
     # departure. Rides are timed from arrival, so the next service's dwell there is taken back off.
+    # The wait is the timetable's for this pair of services where known (cph_transit), else the
+    # average for the next service.
+    def change_minutes(b: int, seconds: float, wait) -> float:
+        wait = route_states[b]["wait"] if wait is None else wait
+        return round(seconds / 60.0 + max(0.0, wait - route_states[b]["dwell"]), 2)
+
     for station_index, station in enumerate(network["stations"]):
-        for from_service, to_service, seconds in station["transfers"]:
+        for from_service, to_service, seconds, wait in station["transfers"]:
             a = state_index[(station_index, from_service)]
             b = state_index[(station_index, to_service)]
-            wait = max(0.0, route_states[b]["wait"] - route_states[b]["dwell"])
-            adjacency[a][b] = [round(seconds / 60.0 + wait, 2)]
+            adjacency[a][b] = [change_minutes(b, seconds, wait)]
+    # Changes between nearby stations (a short walk to another stop) where the timetable makes them
+    # quicker than walking over the street and waiting the average.
+    for from_station, from_service, to_station, to_service, seconds, wait in network.get("walkTransfers", []):
+        a = state_index.get((from_station, from_service))
+        b = state_index.get((to_station, to_service))
+        if a is None or b is None:
+            continue
+        minutes = change_minutes(b, seconds, wait)
+        if minutes < adjacency[a].get(b, [math.inf])[0]:
+            adjacency[a][b] = [minutes]
 
+    print(f"  {underground_stops} of {len(route_states)} station stops underground")
     return (
         stations,
         route_states,
@@ -591,7 +613,7 @@ def build_city(city: City) -> None:
         node_snappable[node] = 1
     print(f"  {len(xs)} nodes, {sum(len(a) for a in street_adjacency)} directed edges")
 
-    stations, route_states, station_states, transit_adjacency = build_transit(network, lat0, node_index, bounds)
+    stations, route_states, station_states, transit_adjacency = build_transit(network, lat0, node_index, bounds, city)
 
     print("Rasterizing grid…")
     land_grid = rasterize_land(land, bounds, cols, rows)
